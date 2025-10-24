@@ -1,0 +1,20 @@
+# App & server
+Flask>=3.0
+flask-cors>=4.0
+gunicorn>=23.0
+
+# LINE SDK
+line-bot-sdk>=3.11
+
+# Google Cloud
+google-cloud-firestore>=2.16
+firebase-admin>=6.6
+google-cloud-secret-manager>=2.20
+google-cloud-storage>=3.3
+
+# Utils
+python-dateutil>=2.9.0.post0   # <— ต้องมี (เราใช้ isoparse)
+requests>=2.31
+line-bot-sdk>=3.11 
+# geohash2==1.1  # <— ถ้าไม่ได้ใช้ แนะนำคอมเมนต์ไว้หรือลบออก
+
