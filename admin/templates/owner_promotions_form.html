@@ -1,0 +1,202 @@
+{% extends "admin/base.html" %}{% block title %}จัดการโปรโมชัน/สินค้า — {{ shop_id or "-" }}{% endblock %}
+{% block header %}โปรโมชัน/สินค้า — {{ shop_id or "-" }}{% endblock %}
+{% block content %}
+<div class="card section">
+  <form id="itemForm" enctype="multipart/form-data">
+    <input type="hidden" name="_id" />
+    <label>ประเภท</label>
+    <select name="category" id="category">
+      <option value="promotion">Promotion</option>
+      <option value="product">Product</option>
+    </select>
+
+    <div id="promotionFields">
+      <label>หัวข้อ</label>
+      <input type="text" name="title" placeholder="เช่น ซื้อ 1 แถม 1">
+      <label>รายละเอียด</label>
+      <textarea name="description" rows="4" placeholder="ระบุเงื่อนไข/ช่วงเวลา ฯลฯ"></textarea>
+      <label>สถานะ</label>
+      <select name="status">
+        <option value="draft">Draft</option>
+        <option value="active">Active</option>
+        <option value="archived">Archived</option>
+      </select>
+      <label>รูปภาพ (อัปโหลดได้หลายไฟล์)</label>
+      <input type="file" name="pictures" id="promoPics" accept="image/*" multiple />
+    </div>
+
+    <div id="productFields" style="display:none">
+      <label>ชื่อสินค้า/บริการ</label>
+      <input type="text" name="topic" placeholder="ชื่อสินค้า/บริการ">
+      <label>รายละเอียด</label>
+      <textarea name="description_prod" rows="4" placeholder="รายละเอียดสินค้า/บริการ"></textarea>
+      <label>ราคาต่อหน่วย (บาท)</label>
+      <input type="number" name="unit_price" min="0" step="0.01" placeholder="เช่น 199.00">
+      <label>รูปภาพ (อัปโหลดได้หลายไฟล์)</label>
+      <input type="file" name="pictures_prod" id="prodPics" accept="image/*" multiple />
+    </div>
+
+    <div style="margin-top:12px">
+      <button class="btn btn-primary" type="submit">บันทึก (Action Orange)</button>
+    </div>
+    <p class="muted">* Promotion: หัวข้อ, รายละเอียด, สถานะ, รูปภาพ | Product: ชื่อ, รายละเอียด, ราคา, รูปภาพ</p>
+  </form>
+</div>
+
+<div class="card">
+  <div style="display:flex;align-items:center;gap:8px">
+    <h3 style="margin:0">รายการล่าสุด</h3>
+    <select id="listType" style="margin-left:auto">
+      <option value="promotion">Promotion</option>
+      <option value="product">Product</option>
+    </select>
+  </div>
+  <div id="list" style="margin-top:8px"></div>
+</div>
+
+<script>
+let shopId = "{{ shop_id or '' }}";
+if(!shopId){
+  const usp = new URLSearchParams(location.search);
+  const sid = usp.get("sid");
+  if(sid){ shopId = sid; }
+}
+
+const formEl = document.getElementById("itemForm");
+const listEl = document.getElementById("list");
+const catEl = document.getElementById("category");
+const listTypeEl = document.getElementById("listType");
+const promoFields = document.getElementById("promotionFields");
+const productFields = document.getElementById("productFields");
+const promoPicsInput = document.getElementById("promoPics");
+const prodPicsInput = document.getElementById("prodPics");
+
+let currentMode = catEl.value === "product" ? "product" : "promotion";
+
+function setMode(mode, { syncSelects = true } = {}){
+  currentMode = mode === "product" ? "product" : "promotion";
+  const isPromotion = currentMode === "promotion";
+  promoFields.style.display = isPromotion ? "" : "none";
+  productFields.style.display = isPromotion ? "none" : "";
+  if(syncSelects){
+    if(catEl.value !== currentMode){ catEl.value = currentMode; }
+    if(listTypeEl.value !== currentMode){ listTypeEl.value = currentMode; }
+  }
+}
+
+catEl.addEventListener("change", () => {
+  setMode(catEl.value);
+  refreshList();
+});
+
+listTypeEl.addEventListener("change", () => {
+  setMode(listTypeEl.value);
+  refreshList();
+});
+
+async function refreshList(){
+  if(!shopId){ listEl.innerHTML = "<<<<<>>>>>>"; return; }
+  const kind = currentMode;
+  const url = kind === "promotion" ? `/owner/${shopId}/promotions` : `/owner/${shopId}/products`;
+  listEl.innerHTML = "Loading...";
+  try{
+    const res = await fetch(url, {
+      credentials: "same-origin",
+      headers: { "Accept": "application/json" }
+    });
+    const raw = await res.text();
+    if(!res.ok){ throw new Error("load_failed"); }
+    let js = {};
+    if(raw){
+      try{
+        js = JSON.parse(raw);
+      }catch(parseErr){
+        console.error("Unexpected response payload", raw);
+      }
+    }
+    listEl.innerHTML = (js.items||[]).map(x => {
+      const pictures = Array.isArray(x.pictures) ? x.pictures : (x.pictures ? [x.pictures] : []);
+      const pics = pictures.map(u => `<img src="${u}" style="height:56px;border:1px solid #e5e7eb;border-radius:6px;margin-right:6px" loading="lazy">`).join("");
+      if(kind === "promotion"){
+        return `
+          <div style="border:1px solid #e5e7eb;border-radius:8px;padding:10px;margin-bottom:8px;background:#fff">
+            <div style="font-weight:700">${x.title || "-"}</div>
+            <div class="muted">${x.status || "draft"}</div>
+            <div>${x.description || ""}</div>
+            <div style="margin-top:6px;display:flex;align-items:center;gap:6px">${pics}</div>
+          </div>
+        `;
+      } else {
+        const price = (() => {
+          const raw = x.unit_price;
+          if(raw === undefined || raw === null || raw === ""){ return "—"; }
+          const num = typeof raw === "number" ? raw : parseFloat(raw);
+          if(Number.isFinite(num)){ return num.toFixed(2); }
+          return raw;
+        })();
+        return `
+          <div style="border:1px solid #e5e7eb;border-radius:8px;padding:10px;margin-bottom:8px;background:#fff">
+            <div style="font-weight:700">${x.topic || x.title || "-"}</div>
+            <div class="muted">฿${price}</div>
+            <div>${x.description || ""}</div>
+            <div style="margin-top:6px;display:flex;align-items:center;gap:6px">${pics}</div>
+          </div>
+        `;
+      }
+    }).join("") || `<div style="padding:12px;border:1px dashed #d1d5db;border-radius:8px;background:#f9fafb">ยังไม่มีรายการ${kind === "promotion" ? "โปรโมชัน" : "สินค้า"}ที่บันทึกไว้</div>`;
+  }catch(e){
+    console.error("refreshList failed", e);
+    listEl.innerHTML = "โหลดรายการล้มเหลว";
+  }
+}
+
+formEl.addEventListener("submit", async (e) => {
+  e.preventDefault();
+  if(!shopId){ alert("ยังไม่ทราบ shop_id — กรุณาเข้าผ่านลิงก์ที่มีพาธ /owner/&lt;shop_id&gt;/... หรือ ?sid="); return; }
+  const fd = new FormData(formEl);
+  const category = fd.get("category");
+
+  let url = "";
+  if(category === "promotion"){
+    url = `/owner/${shopId}/promotions`;
+    fd.delete("pictures_prod");
+    fd.delete("pictures[]");
+    const pics = promoPicsInput && promoPicsInput.files ? promoPicsInput.files : [];
+    for(const f of pics){ fd.append("pictures[]", f); }
+  } else {
+    url = `/owner/${shopId}/products`;
+    fd.delete("pictures");
+    fd.delete("pictures_prod");
+    fd.delete("pictures[]");
+    const pics = prodPicsInput && prodPicsInput.files ? prodPicsInput.files : [];
+    for(const f of pics){ fd.append("pictures[]", f); }
+    if(!fd.get("title") && fd.get("topic")){ fd.set("title", fd.get("topic")); }
+    if(!fd.get("description") && fd.get("description_prod")){ fd.set("description", fd.get("description_prod")); }
+  }
+
+  ["title","topic","description","description_prod"].forEach(key => {
+    const val = fd.get(key);
+    if(typeof val === "string"){ fd.set(key, val.trim()); }
+  });
+
+  try{
+    const res = await fetch(url, { method: "POST", body: fd, credentials: "same-origin" });
+    const js = await res.json();
+    if(!res.ok || !js.ok){ throw new Error(js.error || "save_failed"); }
+    const modeBeforeReset = currentMode;
+    formEl.reset();
+    if(promoPicsInput){ promoPicsInput.value = ""; }
+    if(prodPicsInput){ prodPicsInput.value = ""; }
+    setMode(modeBeforeReset);
+    refreshList();
+    alert("บันทึกแล้ว");
+  }catch(err){
+    console.error(err);
+    alert(`บันทึกล้มเหลว: ${err.message || err}`);
+  }
+});
+
+setMode(currentMode);
+refreshList();
+</script>
+{% endblock %}

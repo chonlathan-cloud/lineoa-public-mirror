@@ -16,7 +16,43 @@ import urllib.request
 from urllib.error import HTTPError, URLError
 import re
 import io
-from report_renderer import _build_report_pdf_v3, _build_report_pdf_weasy
+import base64, json, os, logging
+# Try to import heavy report renderer (uses matplotlib); fall back to a tiny ReportLab-only stub if unavailable
+try:
+    from report_renderer import _build_report_pdf_v3, _build_report_pdf_weasy  # preferred (may import matplotlib)
+except Exception as _rr_err:
+    import io as _io_fallback
+    def _build_report_pdf_v3(shop_id, start_dt, end_dt, **kwargs):
+        """
+        Minimal fallback PDF generator (no charts) to avoid hard dependency on matplotlib.
+        Returns PDF bytes.
+        """
+        try:
+            from reportlab.pdfgen import canvas
+            from reportlab.lib.pagesizes import A4
+            from reportlab.lib.units import cm
+        except Exception:
+            # As a last resort, return a tiny placeholder PDF bytes
+            return b"%PDF-1.3\n%\xe2\xe3\xcf\xd3\n1 0 obj<</Type/Catalog/Pages 2 0 R>>endobj\n2 0 obj<</Type/Pages/Count 1/Kids[3 0 R]>>endobj\n3 0 obj<</Type/Page/Parent 2 0 R/MediaBox[0 0 595 842]/Contents 4 0 R>>endobj\n4 0 obj<</Length 44>>stream\nBT /F1 12 Tf 72 770 Td (Report temporarily unavailable) Tj ET\nendstream endobj\ntrailer<</Root 1 0 R>>\n%%EOF"
+        buf = _io_fallback.BytesIO()
+        c = canvas.Canvas(buf, pagesize=A4)
+        c.setFont("Helvetica", 16)
+        c.drawString(2*cm, 27*cm, "Customer Insight Report (Fallback)")
+        c.setFont("Helvetica", 11)
+        c.drawString(2*cm, 25.8*cm, f"Shop: {shop_id}")
+        try:
+            c.drawString(2*cm, 25.0*cm, f"Period: {start_dt.isoformat()}  →  {end_dt.isoformat()}")
+        except Exception:
+            pass
+        c.setFont("Helvetica", 10)
+        c.drawString(2*cm, 23.5*cm, "Charts unavailable on this runtime (matplotlib not installed).")
+        c.drawString(2*cm, 22.8*cm, "This is a lightweight PDF stub to keep the service healthy.")
+        c.showPage()
+        c.save()
+        return buf.getvalue()
+    def _build_report_pdf_weasy(*args, **kwargs):
+        # Fallback to the same minimal PDF
+        return _build_report_pdf_v3(*args, **kwargs)
 # Optional GCS for media upload
 try:
     from google.cloud import storage
@@ -41,10 +77,12 @@ from dao import (
     find_pending_intent_by_code, confirm_intent_to_payment, reject_intent_by_code,
     find_latest_pending_intent, confirm_latest_pending_intent_to_payment, reject_latest_pending_intent, attach_recent_intent_by_user,
 )
+from admin.onboarding import (
+    get_session, save_session, clear_session,
+    upload_logo_bytes, finalize_request_from_session, to_flex_summary
+)
 
 from firestore_client import get_db
-from admin.blueprint import admin_bp
-from owner.blueprint import owner_bp
 
 # Optional LINE reply (created per-tenant only when needed)
 try:
@@ -60,44 +98,61 @@ except Exception:
 # --- LINE profile helper ---
 from typing import Tuple
 
-def _fetch_line_profile(access_token: Optional[str], user_id: str) -> Dict[str, Optional[str]]:
-    """Fetch user's LINE profile; returns {display_name, picture_url}. Safe-fail."""
+def _fetch_line_profile(access_token: Optional[str], user_id: str, shop_id: Optional[str] = None) -> Dict[str, Optional[str]]:
+    """Fetch user's LINE profile; returns {display_name, picture_url}. Also persists display to shops/{shop}/customers/{user_id} when shop_id is provided."""
     if not access_token or not LineBotApi:
         return {}
     try:
         api = LineBotApi(access_token)
         prof = api.get_profile(user_id)
-        return {
+        result = {
             "display_name": getattr(prof, "display_name", None),
             "picture_url": getattr(prof, "picture_url", None),
         }
+        # Persist display name for customer if we know the shop
+        try:
+            if shop_id and result.get("display_name"):
+                db = get_db()
+                ref = db.collection("shops").document(shop_id).collection("customers").document(user_id)
+                ref.set({
+                    "display_name": result["display_name"],
+                    "updated_at": datetime.now(timezone.utc),
+                    # keep existing first/last interaction fields untouched
+                }, merge=True)
+        except Exception as pe:
+            logger.warning("persist display_name failed: %s %s", pe, _log_ctx(shop_id=shop_id, user_id=user_id))
+        return result
     except Exception as e:
         logger.warning("get_profile failed: %s %s", e, _log_ctx(user_id=user_id))
         return {}
 
-# Optional Secret Manager (if you store secrets there)
-try:
-    from google.cloud import secretmanager
-    _SM_AVAILABLE = True
-except Exception:
-    _SM_AVAILABLE = False
+ # --- core shared (for credential loading two-mode) ---
+from core.secrets import load_shop_context_by_destination as core_load_ctx, resolve_secret as core_resolve_secret
 
 # ---------- App ----------
 app = Flask(__name__)
-# ---- App bootstrap: secret key + blueprints ----
 import os as _os_boot
 if not getattr(app, "secret_key", None):
     app.secret_key = _os_boot.environ.get("FLASK_SECRET_KEY", "dev-secret-key")
 
 from admin.blueprint import admin_bp
-from owner.blueprint import owner_bp
+# from owner.blueprint import owner_bp  # (optional; keep commented if not used)
 
 app.register_blueprint(admin_bp)
-app.register_blueprint(owner_bp)
+# app.register_blueprint(owner_bp)  # (optional)
 # ---- end bootstrap ----
 CORS(app)
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("lineoa-frontend-mt")
+
+# ---- Health check and root probe for Cloud Run ----
+@app.get("/_ah/health")
+def _health():
+    return "ok", 200
+
+@app.get("/")
+def _root():
+    return jsonify({"ok": True, "service": "lineoa-frontend", "ts": datetime.now(timezone.utc).isoformat()}), 200
 
 API_BEARER_TOKEN = os.environ.get("API_BEARER_TOKEN", "")
 
@@ -203,7 +258,13 @@ def _is_valid_line_user_id(uid: str) -> bool:
 def _get_settings_by_shop_id(shop_id: str) -> Dict[str, Any]:
     db = get_db()
     snap = db.collection("shops").document(shop_id).collection("settings").document("default").get()
-    return snap.to_dict() if snap.exists else {}
+    if not snap.exists:
+        logger.error("missing settings/default for %s", shop_id)
+        return {}
+    data = snap.to_dict() or {}
+    if not data:
+        logger.error("empty settings/default for %s", shop_id)
+    return data
 
 def _ensure_shop_display_name(shop_id: str, access_token: Optional[str]) -> None:
     """Ensure the LINE OA display name is saved to owner_profile/default.line_display_name once."""
@@ -272,42 +333,49 @@ def _push_payment_review_to_owners(shop_id: str, access_token: Optional[str], us
 
 def _get_shop_and_settings_by_line_oa_id(line_oa_id: str) -> Optional[Dict[str, Any]]:
     destination = line_oa_id
-    # 1) map แบบถูกต้อง: bot_user_id (destination จะเป็น U...)
-    shop_id = get_shop_id_by_bot_user_id(destination)
-
-    # 2) เผื่อกรณีทดสอบ/ค่าเป็นตัวเลข → ลอง map ด้วย Channel ID (line_oa_id) แบบเก่า
-    if not shop_id and destination and destination.isdigit():
-        shop_id = get_shop_id_by_line_oa_id(destination)
-
-    # 3) dev fallback
-    if not shop_id and DEFAULT_SHOP_ID:
-        settings = _get_settings_by_shop_id(DEFAULT_SHOP_ID) or {}
-        logger.warning("Fallback to DEFAULT_SHOP_ID=%s for destination=%s", DEFAULT_SHOP_ID, destination)
-        return {"shop_id": DEFAULT_SHOP_ID, "settings": settings}
-
-    if not shop_id:
+    # Use core mapping (supports bot_user_id and numeric channelId) + DEFAULT_SHOP_ID fallback
+    ctx = core_load_ctx(destination)
+    if not ctx:
         return None
-
-    settings = _get_settings_by_shop_id(shop_id)
-    return {"shop_id": shop_id, "settings": settings or {}}
+    return {"shop_id": ctx["shop_id"], "settings": ctx.get("settings") or {}}
 
 def _resolve_secret_value(settings: Dict[str, Any], direct_key: str, sm_key: str) -> Optional[str]:
-    val = settings.get(direct_key)
-    if val:
-        return val
-    sm_res = settings.get(sm_key)
-    if not sm_res:
-        return None
-    if not _SM_AVAILABLE:
-        logger.error("Secret Manager referenced but package not available: %s", sm_res)
-        return None
+    """
+    Resolve a credential by reading *direct keys only* from settings/default.
+    Priority:
+      1) settings.oa_consumer.<key>
+      2) settings.<key>
+    We intentionally do NOT resolve any sm_* references here.
+    """
+    # Normalize to dicts
+    settings = settings or {}
+    consumer = (settings.get("oa_consumer") or {}) if isinstance(settings.get("oa_consumer"), dict) else {}
+
+    # Map expected keys
+    # direct_key will be one of: "line_channel_access_token" or "line_channel_secret"
+    key = direct_key
+
+    # Prefer consumer-scoped value
+    val = consumer.get(key)
+    if not val:
+        val = settings.get(key)
+    return val
+
+def _store_customer_last_message(shop_id: str, user_id: str, message: str, ctx: str) -> None:
+    if not shop_id or not user_id:
+        return
     try:
-        sm = secretmanager.SecretManagerServiceClient()
-        resp = sm.access_secret_version(name=sm_res)
-        return resp.payload.data.decode("utf-8")
-    except Exception as e:
-        logger.exception("Secret Manager access failed for %s: %s", sm_res, e)
-        return None
+        ref = (
+            get_db().collection("shops")
+            .document(shop_id)
+            .collection("customers").document(user_id)
+        )
+        ref.set({
+            "last_message": message,
+            "last_interaction_at": datetime.now(timezone.utc),
+        }, merge=True)
+    except Exception as err:
+        logger.warning("update customer last_message failed: %s %s", err, ctx)
 
 def _compute_signature(channel_secret: str, body: bytes) -> str:
     mac = hmac.new(channel_secret.encode("utf-8"), body, hashlib.sha256).digest()
@@ -709,6 +777,62 @@ def _upload_pdf_to_gcs(pdf_bytes: bytes, shop_id: str, report_id: str) -> dict:
     "public_url": public_url,
     "signed_url": pub
     }
+
+# ---------- Pub/Sub push helpers ----------
+def _verify_pubsub_token():
+    """Verify a simple shared token for Pub/Sub push (query ?token=... or header X-PubSub-Token)."""
+    want = os.environ.get("PUBSUB_TOKEN", "").strip()
+    if not want:
+        return True  # if not configured, allow (service may be publicly reachable)
+    got = (request.args.get("token") or request.headers.get("X-PubSub-Token") or "").strip()
+    return bool(got) and (got == want)
+
+def _parse_pubsub_envelope():
+    """Parse Pub/Sub push JSON envelope -> (attributes:dict, data:dict). Safe-fail."""
+    try:
+        env = request.get_json(force=True, silent=True) or {}
+        msg = env.get("message") or {}
+        attrs = msg.get("attributes") or {}
+        data_raw = msg.get("data")
+        data = {}
+        if data_raw:
+            try:
+                data = json.loads(base64.b64decode(data_raw).decode("utf-8"))
+            except Exception:
+                try:
+                    data = {"_raw": base64.b64decode(data_raw).decode("utf-8", "ignore")}
+                except Exception:
+                    data = {"_raw_b64": data_raw}
+        return attrs, data
+    except Exception as e:
+        logger.warning("parse pubsub envelope failed: %s %s", e, _log_ctx())
+        return {}, {}
+
+@app.post("/pubsub/promotion-updated")
+def pubsub_promotion_updated():
+    if not _verify_pubsub_token():
+        abort(401, "bad_token")
+    attrs, data = _parse_pubsub_envelope()
+    shop_id = attrs.get("shop_id") or (data.get("shop_id") if isinstance(data, dict) else None)
+    promo_id = attrs.get("promotion_id") or (data.get("promotion_id") if isinstance(data, dict) else None)
+    op = attrs.get("op") or (data.get("op") if isinstance(data, dict) else None)
+    logger.info("promotion.updated received shop=%s promo=%s op=%s payload=%s", shop_id, promo_id, op, json.dumps(data)[:500])
+    return ("", 204)
+
+# --- Product updated Pub/Sub route ---
+@app.post("/pubsub/product-updated")
+def pubsub_product_updated():
+    if not _verify_pubsub_token():
+        abort(401, "bad_token")
+    attrs, data = _parse_pubsub_envelope()
+    shop_id = attrs.get("shop_id") or (data.get("shop_id") if isinstance(data, dict) else None)
+    product_id = attrs.get("product_id") or (data.get("product_id") if isinstance(data, dict) else None)
+    op = attrs.get("op") or (data.get("op") if isinstance(data, dict) else None)
+    logger.info("product.updated received shop=%s product=%s op=%s payload=%s", shop_id, product_id, op, json.dumps(data)[:500])
+    # TODO: refresh caches / invalidate storefront listings if needed
+    return ("", 204)
+
+
 # ---------- Routes ----------
 
 @app.get("/front/health")
@@ -773,6 +897,7 @@ def line_webhook():
             user_id = (ev.get("source", {}) or {}).get("userId", "")
             event_id = ev.get("webhookEventId") or msg.get("id") or ev.get("replyToken")
             message_id = msg.get("id")
+            replyToken = ev.get("replyToken")
 
             if ev_type != "message":
                 logger.info("skip non-message %s %s", ev_type, _log_ctx(shop_id, user_id, event_id, message_id))
@@ -798,6 +923,13 @@ def line_webhook():
             except Exception as e:
                 logger.warning("is_owner_user check failed: %s %s", e, _log_ctx(shop_id, user_id, event_id, message_id))
 
+            api = None
+            if access_token and LineBotApi:
+                try:
+                    api = LineBotApi(access_token)
+                except Exception as e:
+                    logger.warning("LineBotApi init failed: %s %s", e, _log_ctx(shop_id, user_id, event_id, message_id))
+
             # ensure customer exists/updated (also fetch LINE profile once)
             try:
                 prof = _fetch_line_profile(access_token, user_id)
@@ -808,8 +940,164 @@ def line_webhook():
             except Exception as e:
                 logger.warning("upsert_customer failed %s %s", e, _log_ctx(shop_id, user_id, event_id, message_id))
 
+            text = (msg.get("text") or "").strip()
+            low_txt = text.lower()
+            sess: Dict[str, Any] = {}
+            step = 0
+            if not owner:
+                try:
+                    sess = get_session(user_id) or {}
+                    step = int(sess.get("step") or 0)
+                    if user_id and sess and not sess.get("messaging_user_id"):
+                        sess["messaging_user_id"] = user_id
+                        save_session(user_id, sess)
+                except Exception as e:
+                    logger.warning("onboarding get_session failed: %s %s", e, _log_ctx(shop_id, user_id))
+                    sess = {}
+                    step = 0
+
+            def _reply_line(messages):
+                if not replyToken or not api:
+                    logger.warning("skip reply (LINE client unavailable) %s", _log_ctx(shop_id, user_id, event_id))
+                    return
+                try:
+                    msg_list = messages if isinstance(messages, list) else [messages]
+                    api.reply_message(replyToken, msg_list)
+                except Exception as e:
+                    logger.warning("reply failed: %s %s", e, _log_ctx(shop_id, user_id, event_id, message_id))
+
+            def _qr_text(msg: str, add_online: bool = False):
+                if not TextSendMessage:
+                    return None
+                if QuickReply and QuickReplyButton and MessageAction:
+                    items = [QuickReplyButton(action=MessageAction(label="ยกเลิก", text="ยกเลิก"))]
+                    if add_online:
+                        items.append(QuickReplyButton(action=MessageAction(label="ร้านออนไลน์", text="ร้านออนไลน์")))
+                    return TextSendMessage(text=msg, quick_reply=QuickReply(items=items))
+                return TextSendMessage(text=msg)
+
+            onboarding_handled = False
+            start_keywords = ("เริ่มต้นใช้งาน", "เริ่มต้นเปิดร้านของคุณ")
+
+            if not owner and mtype == "text":
+                if low_txt in start_keywords:
+                    clear_session(user_id)
+                    sess = {
+                        "step": 1,
+                        "created_at": datetime.now(timezone.utc),
+                        "messaging_user_id": user_id,
+                    }
+                    save_session(user_id, sess)
+                    logger.info("onboarding start %s", _log_ctx(shop_id, user_id, event_id, message_id))
+                    msg_obj = _qr_text("ยินดีต้อนรับสู่การเปิดร้านใหม่ครับ! ✨\nขั้นที่ 1/4 ชื่อ-นามสกุลของผู้ติดต่อคือ?")
+                    if msg_obj:
+                        _reply_line(msg_obj)
+                    onboarding_handled = True
+                elif low_txt == "ยกเลิก" and step:
+                    clear_session(user_id)
+                    logger.info("onboarding cancel %s", _log_ctx(shop_id, user_id, event_id, message_id))
+                    msg_obj = _qr_text("🙅 ยกเลิกขั้นตอนแล้วครับ\nพิมพ์ “เริ่มต้นใช้งาน” เพื่อเริ่มใหม่ได้เลย")
+                    if msg_obj:
+                        _reply_line(msg_obj)
+                    onboarding_handled = True
+                elif low_txt in ("ยืนยันข้อมูล", "ยืนยัน"):
+                    if sess.get("name") and sess.get("phone") and sess.get("shop"):
+                        req_id = finalize_request_from_session(user_id)
+                        if req_id:
+                            logger.info("onboarding finalized req=%s %s", req_id, _log_ctx(shop_id, user_id, event_id, message_id))
+                            summary = [
+                                "✅ ส่งคำขอเปิดร้านเรียบร้อย!",
+                                f"รหัสคำขอ: {req_id}",
+                                f"ชื่อร้าน: {sess.get('shop')}",
+                                f"ผู้ติดต่อ: {sess.get('name')} • {sess.get('phone')}",
+                                "ทีมงานจะติดต่อกลับภายใน 1 วันทำการครับ 🙌",
+                            ]
+                            msg_obj = TextSendMessage(text="\n".join(summary)) if TextSendMessage else None
+                            if msg_obj:
+                                _reply_line(msg_obj)
+                            clear_session(user_id)
+                        else:
+                            msg_obj = _qr_text("ข้อมูลยังไม่ครบครับ ลองตรวจสอบและยืนยันอีกครั้งนะครับ", add_online=True)
+                            if msg_obj:
+                                _reply_line(msg_obj)
+                    else:
+                        msg_obj = _qr_text("ยังขาดข้อมูลบางอย่างครับ ใส่ชื่อ เบอร์ และชื่อร้านให้ครบก่อนนะครับ", add_online=True)
+                        if msg_obj:
+                            _reply_line(msg_obj)
+                    onboarding_handled = True
+                elif step == 1 and text:
+                    sess["name"] = text.strip()
+                    sess["step"] = 2
+                    save_session(user_id, sess)
+                    msg_obj = _qr_text("เยี่ยมเลย! ขั้นที่ 2/4 กรุณาพิมพ์เบอร์มือถือ (เช่น 0812345678) ครับ")
+                    if msg_obj:
+                        _reply_line(msg_obj)
+                    onboarding_handled = True
+                elif step == 2:
+                    phone = _normalize_phone_th(text)
+                    if phone and len(phone) == 10 and phone.startswith("0"):
+                        sess["phone"] = phone
+                        sess["step"] = 3
+                        save_session(user_id, sess)
+                        msg_obj = _qr_text("เรียบร้อยครับ! ขั้นที่ 3/4 ต้องการใช้ชื่อร้านบน LINE OA ว่าอะไรครับ?")
+                    else:
+                        msg_obj = _qr_text("ขอเป็นเบอร์มือถือ 10 หลักนะครับ เช่น 0812345678", add_online=False)
+                    if msg_obj:
+                        _reply_line(msg_obj)
+                    onboarding_handled = True
+                elif step == 3 and text:
+                    sess["shop"] = text.strip()
+                    sess["step"] = 4
+                    save_session(user_id, sess)
+                    msg_obj = _qr_text("ขั้นสุดท้าย! แชร์ตำแหน่งร้าน หรือพิมพ์ “ร้านออนไลน์” ถ้าไม่มีหน้าร้านครับ", add_online=True)
+                    if msg_obj:
+                        _reply_line(msg_obj)
+                    onboarding_handled = True
+                elif step == 4 and low_txt == "ร้านออนไลน์":
+                    sess["location"] = None
+                    sess["step"] = 5
+                    save_session(user_id, sess)
+                    msg_obj = TextSendMessage(text="รับทราบครับ 🛒 ตรวจสอบข้อมูลอีกครั้ง แล้วพิมพ์ “ยืนยันข้อมูล” เพื่อส่งให้ทีมงานนะครับ") if TextSendMessage else None
+                    if msg_obj:
+                        _reply_line(msg_obj)
+                    onboarding_handled = True
+
+            if not owner and mtype == "location" and step == 4:
+                sess["location"] = {
+                    "title": msg.get("title") or "ตำแหน่งร้าน",
+                    "address": msg.get("address"),
+                    "lat": msg.get("latitude"),
+                    "lng": msg.get("longitude")
+                }
+                sess["step"] = 5
+                save_session(user_id, sess)
+                logger.info("onboarding location captured %s", _log_ctx(shop_id, user_id, event_id, message_id))
+                msg_obj = TextSendMessage(text="รับพิกัดแล้วครับ 📍 ตรวจสอบข้อมูลอีกครั้ง แล้วพิมพ์ “ยืนยันข้อมูล” ได้เลย") if TextSendMessage else None
+                if msg_obj:
+                    _reply_line(msg_obj)
+                onboarding_handled = True
+
+            if not owner and mtype == "image" and step in (1, 2, 3, 4, 5):
+                media = _download_line_content(access_token, message_id)
+                if media:
+                    content, ct = media
+                    url = upload_logo_bytes(user_id, content, ct)
+                    if url:
+                        sess["logo_url"] = url
+                        save_session(user_id, sess)
+                        logger.info("onboarding logo stored %s", _log_ctx(shop_id, user_id, event_id, message_id))
+                        reply_msg = TextSendMessage(text="📸 รับโลโก้เรียบร้อยครับ!") if TextSendMessage else None
+                    else:
+                        logger.warning("onboarding logo upload failed %s", _log_ctx(shop_id, user_id, event_id, message_id))
+                        reply_msg = TextSendMessage(text="อัปโหลดรูปไม่สำเร็จ ลองใหม่อีกครั้งนะครับ") if TextSendMessage else None
+                    if reply_msg:
+                        _reply_line(reply_msg)
+                onboarding_handled = True
+
+            if onboarding_handled:
+                continue
+
             if mtype == "text":
-                text = (msg.get("text") or "").strip()
                 if owner:
                     low = text.lower()
                     saved_owner_any = False
@@ -1002,6 +1290,7 @@ def line_webhook():
                             logger.exception("create payment intent failed: %s %s", _e, _log_ctx(shop_id, user_id, event_id, message_id))
                 extra = {"raw": {"message_id": msg.get("id")}}
                 save_message(shop_id, user_id, text=text, ts=None, direction="inbound", intent=intent, extra=extra)
+                _store_customer_last_message(shop_id, user_id, text, _log_ctx(shop_id, user_id, event_id, message_id))
                 logger.info("recv text %s text=%s", _log_ctx(shop_id, user_id, event_id, message_id), text[:200])
                 continue
 
@@ -1015,6 +1304,7 @@ def line_webhook():
                 logger.info("owner location saved %s loc=%s", _log_ctx(shop_id, user_id, event_id, message_id), loc)
                 extra = {"raw": {"message_id": msg.get("id")}, "location": loc, "type": "location"}
                 save_message(shop_id, user_id, text="<owner location>", ts=None, direction="inbound", intent="owner_location", extra=extra)
+                _store_customer_last_message(shop_id, user_id, "<owner location>", _log_ctx(shop_id, user_id, event_id, message_id))
                 continue
 
             if mtype in ("image", "video", "audio"):
@@ -1039,6 +1329,7 @@ def line_webhook():
                 extra = {"raw": {"message_id": message_id}, "media": media_info, "type": mtype}
                 placeholder = f"&lt;{mtype} message&gt;"
                 save_message(shop_id, user_id, text=placeholder, ts=None, direction="inbound", intent=mtype, extra=extra)
+                _store_customer_last_message(shop_id, user_id, placeholder, _log_ctx(shop_id, user_id, event_id, message_id))
                 logger.info("recv %s %s stored=%s ct=%s", mtype, _log_ctx(shop_id, user_id, event_id, message_id), bool(media_info), content_type)
                 continue
 
@@ -1443,3 +1734,86 @@ def task_generate_biwk_report():
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", "8080"))
     app.run(host="0.0.0.0", port=port, debug=True)
+# === Pub/Sub push endpoints (consumer) ===
+# These endpoints allow Cloud Pub/Sub to push changes from admin to consumer.
+# They respond with 204 to prevent Pub/Sub retries once processed.
+
+from flask import request, abort  # ensure available in this scope
+import os as _os_pubsub
+import json as _json_pubsub
+import base64 as _b64_pubsub
+import logging as _logging_pubsub
+from firestore_client import get_db as _get_db_pubsub
+from firebase_admin import firestore as _fb_pubsub
+
+_pub_logger = _logging_pubsub.getLogger("lineoa-frontend-mt")
+
+def _require_pubsub_token():
+    want = _os_pubsub.environ.get("PUBSUB_TOKEN", "")
+    got = (request.args.get("token") or request.headers.get("X-PubSub-Token") or "").strip()
+    if not want or got != want:
+        abort(401, "bad token")
+
+def _parse_pubsub_envelope():
+    env = request.get_json(silent=True) or {}
+    msg = env.get("message") or {}
+    attrs = msg.get("attributes") or {}
+    payload = {}
+    data_b64 = msg.get("data")
+    if data_b64:
+        try:
+            payload = _json_pubsub.loads(_b64_pubsub.b64decode(data_b64).decode("utf-8"))
+        except Exception as e:
+            _pub_logger.warning("pubsub decode error: %s", e)
+    return attrs, payload
+
+@app.post("/pubsub/promotion-updated", endpoint="pubsub_promotion_updated_v2")
+def pubsub_promotion_updated_v2():
+    _require_pubsub_token()
+    attrs, payload = _parse_pubsub_envelope()
+    shop_id = attrs.get("shop_id") or _os_pubsub.getenv("DEFAULT_SHOP_ID", "")
+    promo_id = attrs.get("promotion_id")
+    op = (attrs.get("op") or "upsert").lower()
+
+    if not shop_id or not promo_id:
+        return ("", 204)
+
+    db = _get_db_pubsub()
+    ref = db.collection("shops").document(shop_id).collection("promotions").document(promo_id)
+    try:
+        if op == "delete":
+            ref.delete()
+        else:
+            payload = (payload or {})
+            payload["updated_at"] = _fb_pubsub.SERVER_TIMESTAMP
+            # set merge=True to avoid overwriting existing fields unintentionally
+            ref.set(payload, merge=True)
+        _pub_logger.info("promotion.updated handled: shop=%s id=%s op=%s", shop_id, promo_id, op)
+    except Exception as e:
+        _pub_logger.error("promotion.updated error: %s shop=%s id=%s", e, shop_id, promo_id)
+    return ("", 204)
+
+@app.post("/pubsub/product-updated", endpoint="pubsub_product_updated_v2")
+def pubsub_product_updated_v2():
+    _require_pubsub_token()
+    attrs, payload = _parse_pubsub_envelope()
+    shop_id = attrs.get("shop_id") or _os_pubsub.getenv("DEFAULT_SHOP_ID", "")
+    product_id = attrs.get("product_id")
+    op = (attrs.get("op") or "upsert").lower()
+
+    if not shop_id or not product_id:
+        return ("", 204)
+
+    db = _get_db_pubsub()
+    ref = db.collection("shops").document(shop_id).collection("products").document(product_id)
+    try:
+        if op == "delete":
+            ref.delete()
+        else:
+            payload = (payload or {})
+            payload["updated_at"] = _fb_pubsub.SERVER_TIMESTAMP
+            ref.set(payload, merge=True)
+        _pub_logger.info("product.updated handled: shop=%s id=%s op=%s", shop_id, product_id, op)
+    except Exception as e:
+        _pub_logger.error("product.updated error: %s shop=%s id=%s", e, shop_id, product_id)
+    return ("", 204)

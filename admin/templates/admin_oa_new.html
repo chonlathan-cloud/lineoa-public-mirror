@@ -1,0 +1,308 @@
+<!doctype html>
+<html lang="th">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>ลงทะเบียน LINE OA ใหม่</title>
+  <style>
+    :root {
+      --bg:#f5f7fb;
+      --card:#ffffff;
+      --border:#d7dce3;
+      --ink:#1f2937;
+      --accent:#2563eb;
+      --accent-soft:rgba(37,99,235,0.08);
+      --danger:#ef4444;
+      --muted:#6b7280;
+    }
+    body {
+      margin:0;
+      background:var(--bg);
+      color:var(--ink);
+      font:15px/1.6 -apple-system,BlinkMacSystemFont,"Segoe UI",Helvetica,Arial,sans-serif;
+    }
+    .wrap {
+      max-width:720px;
+      margin:0 auto;
+      padding:24px 16px 64px;
+    }
+    h1 {
+      font-size:24px;
+      margin:0 0 16px;
+    }
+    .card {
+      background:var(--card);
+      border:1px solid var(--border);
+      border-radius:14px;
+      padding:20px;
+      margin-bottom:20px;
+      box-shadow:0 12px 35px -20px rgba(15,23,42,0.5);
+    }
+    .grid {
+      display:grid;
+      grid-template-columns:repeat(auto-fit,minmax(220px,1fr));
+      gap:14px;
+    }
+    label {
+      display:block;
+      font-weight:600;
+      margin-bottom:6px;
+    }
+    input[type=text],
+    textarea {
+      width:100%;
+      border:1px solid var(--border);
+      border-radius:10px;
+      padding:10px 12px;
+      font:inherit;
+      background:#fff;
+      box-sizing:border-box;
+    }
+    textarea {
+      min-height:100px;
+      resize:vertical;
+    }
+    input[readonly] {
+      background:#f3f4f6;
+      color:var(--muted);
+    }
+    .btn {
+      display:inline-flex;
+      align-items:center;
+      justify-content:center;
+      gap:8px;
+      padding:10px 18px;
+      border:none;
+      border-radius:12px;
+      background:var(--accent);
+      color:#fff;
+      font-weight:600;
+      cursor:pointer;
+      transition:transform 0.15s ease,box-shadow 0.15s ease;
+    }
+    .btn:hover { transform:translateY(-1px); box-shadow:0 12px 22px -16px rgba(37,99,235,0.9); }
+    .muted { color:var(--muted); font-size:13px; margin-top:4px; }
+    .section-title { font-size:16px; font-weight:700; margin:4px 0 12px; }
+    .alert {
+      background:rgba(239,68,68,0.08);
+      border:1px solid rgba(239,68,68,0.4);
+      color:var(--danger);
+      padding:12px 16px;
+      border-radius:12px;
+      margin-bottom:16px;
+    }
+    .summary {
+      background:var(--accent-soft);
+      border-radius:12px;
+      padding:14px;
+      margin-top:12px;
+      overflow:auto;
+      font-size:13px;
+    }
+    .prefill-card{
+      margin-top:16px;
+      padding:14px;
+      border-radius:12px;
+      background:#f9fafc;
+      border:1px dashed var(--border);
+      display:flex;
+      gap:14px;
+      align-items:center;
+    }
+    .prefill-card img{
+      width:64px;
+      height:64px;
+      object-fit:cover;
+      border-radius:12px;
+      border:1px solid var(--border);
+      background:#fff;
+    }
+    .prefill-meta{
+      flex:1;
+    }
+    .prefill-meta div{
+      font-size:14px;
+      margin-bottom:4px;
+    }
+    @media (max-width:540px) {
+      .card { padding:16px; }
+      h1 { font-size:21px; }
+    }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <h1>ลงทะเบียน LINE OA ใหม่ (Admin)</h1>
+
+    {% if errors %}
+      <div class="alert">
+        <strong>ไม่สามารถบันทึกได้:</strong>
+        <ul style="margin:8px 0 0 18px;padding:0;">
+          {% for err in errors %}
+            <li>{{ err }}</li>
+          {% endfor %}
+        </ul>
+      </div>
+    {% endif %}
+
+    <form method="post" class="card">
+      <input type="hidden" name="prefill_id" value="{{ prefill_id }}">
+      <div class="section-title">ค่า Global (อ่านอย่างเดียว)</div>
+      <div class="grid">
+        <div>
+          <label>GLOBAL_LIFF_ID</label>
+          <input type="text" readonly value="{{ env_info.GLOBAL_LIFF_ID }}">
+        </div>
+        <div>
+          <label>LIFF_ID_REPORT</label>
+          <input type="text" readonly value="{{ env_info.LIFF_ID_REPORT }}">
+        </div>
+        <div>
+          <label>LIFF_ID_PROMOTION</label>
+          <input type="text" readonly value="{{ env_info.LIFF_ID_PROMOTION }}">
+        </div>
+        <div>
+          <label>GLOBAL_LINE_LOGIN_CHANNEL_ID</label>
+          <input type="text" readonly value="{{ env_info.GLOBAL_LINE_LOGIN_CHANNEL_ID }}">
+        </div>
+        <div>
+          <label>MEDIA_BUCKET</label>
+          <input type="text" readonly value="{{ env_info.MEDIA_BUCKET }}">
+        </div>
+        <div>
+          <label>REPORT_BUCKET</label>
+          <input type="text" readonly value="{{ env_info.REPORT_BUCKET }}">
+        </div>
+      </div>
+
+      <hr style="margin:20px -20px; border:none; border-top:1px solid var(--border);">
+
+      {% if prefill_data %}
+        <div class="section-title">ข้อมูลจากคำขอ onboarding</div>
+        <div class="prefill-card">
+          {% if prefill_data.logo_url %}
+            <img src="{{ prefill_data.logo_url }}" alt="logo">
+          {% else %}
+            <img src="https://dummyimage.com/128x128/d1d5db/1f2937&text=LOGO" alt="logo">
+          {% endif %}
+          <div class="prefill-meta">
+            <div><strong>ชื่อร้าน:</strong> {{ prefill_data.shop or "-" }}</div>
+            <div><strong>ผู้ติดต่อ:</strong> {{ prefill_data.name or "-" }}</div>
+            <div><strong>โทรศัพท์:</strong> {{ prefill_data.phone or "-" }}</div>
+            {% if prefill_data.location and prefill_data.location.address %}
+              <div><strong>ที่อยู่:</strong> {{ prefill_data.location.address }}</div>
+            {% endif %}
+            {% if prefill_data.messaging_user_id %}
+              <div><strong>LINE user ID:</strong> {{ prefill_data.messaging_user_id }}</div>
+            {% endif %}
+          </div>
+          <div>
+            <a class="muted" href="/admin/oa/requests" style="text-decoration:none;">เปลี่ยนคำขอ</a>
+          </div>
+        </div>
+      {% endif %}
+
+      <div class="section-title">ข้อมูล OA ใหม่</div>
+      <div class="grid">
+        <div>
+          <label>Channel ID *</label>
+          <input type="text" name="channel_id" value="{{ form.channel_id }}" placeholder="เช่น 2008xxxxxx" required>
+        </div>
+        <div>
+          <label>LINE OA Display Name</label>
+          <input type="text" name="oa_display_name" value="{{ form.oa_display_name }}" placeholder="ชื่อที่แสดงใน LINE OA">
+        </div>
+        <div>
+          <label>LINE OA ID (ถ้ามี)</label>
+          <input type="text" name="line_oa_id" value="{{ form.line_oa_id }}" placeholder="Uxxxxxxxxxxxxxxxxxxxxx">
+        </div>
+      </div>
+
+      <label style="margin-top:16px;">Channel Access Token *</label>
+      <textarea name="line_channel_access_token" placeholder="นำมาวางทีเดียว (one-time)" required></textarea>
+      <p class="muted">* เก็บเข้าฐานข้อมูล via Secret Manager (ค่าไม่แสดงซ้ำหลังจากบันทึก)</p>
+
+      <label style="margin-top:16px;">Channel Secret *</label>
+      <textarea name="line_channel_secret" placeholder="Channel secret (one-time)" required></textarea>
+
+      <div style="margin-top:20px;">
+        <button type="submit" class="btn">บันทึก OA ใหม่</button>
+      </div>
+    </form>
+
+    {% if result %}
+      <div class="card">
+        <div class="section-title">สร้างสำเร็จ 🎉</div>
+        {% if result.invite_info %}
+          <p class="muted">ระบบสร้างลิงก์เชิญเจ้าของร้านให้แล้ว สามารถคัดลอกได้ด้านล่าง</p>
+        {% endif %}
+        <div class="grid">
+          <div>
+            <label>Shop ID</label>
+            <input type="text" readonly value="{{ result.shop_id }}">
+          </div>
+          {% if result.prefill_id %}
+          <div>
+            <label>Request ID</label>
+            <input type="text" readonly value="{{ result.prefill_id }}">
+          </div>
+          {% endif %}
+          <div>
+            <label>Owner Sign-in URL</label>
+            <input type="text" readonly value="{{ result.owner_signin_url }}">
+            <p class="muted">แชร์ให้เจ้าของเพื่อเข้าสู่ระบบ (ผ่าน Global LIFF)</p>
+          </div>
+          <div>
+            <label>Webhook URL (Consumer)</label>
+            <input type="text" readonly value="{{ result.webhook_url }}">
+          </div>
+        </div>
+
+        {% if result.invite_info %}
+          <div class="section-title" style="margin-top:18px;">Owner Invite Link</div>
+          <div class="summary">
+            <div><strong>ลิงก์:</strong> <a href="{{ result.invite_info.url }}" target="_blank">{{ result.invite_info.url }}</a></div>
+            {% if result.invite_info.token %}
+              <div><strong>Token:</strong> {{ result.invite_info.token }}</div>
+            {% endif %}
+            <div><strong>รหัสเชิญ (jti):</strong> {{ result.invite_info.jti }}</div>
+            {% if result.invite_info.messaging_user_id %}
+              <div><strong>ส่งถึง LINE user:</strong> {{ result.invite_info.messaging_user_id }}</div>
+            {% endif %}
+            <div><strong>สถานะส่งผ่านแชท:</strong>
+              {% if result.invite_info.error %}
+                <span style="color:#b91c1c;">ล้มเหลว ({{ result.invite_info.error }})</span>
+              {% else %}
+                {% if result.invite_info.pushed %}
+                  <span style="color:#0f766e;">ส่งสำเร็จ</span>
+                {% elif result.invite_info.push_error %}
+                  <span style="color:#b91c1c;">ล้มเหลว ({{ result.invite_info.push_error }})</span>
+                {% else %}
+                  <span class="muted">ไม่ได้ส่งอัตโนมัติ</span>
+                {% endif %}
+              {% endif %}
+            </div>
+            <p class="muted">สำรอง: คัดลอกลิงก์ด้านบนส่งให้เจ้าของร้านได้เลย</p>
+          </div>
+        {% endif %}
+
+        <div class="section-title" style="margin-top:18px;">Credentials</div>
+        <div class="grid">
+          <div>
+            <label>Channel Access Token</label>
+            <input type="text" readonly value="{{ result.secrets.access_token }}">
+          </div>
+          <div>
+            <label>Channel Secret</label>
+            <input type="text" readonly value="{{ result.secrets.channel_secret }}">
+          </div>
+        </div>
+
+        <div class="section-title" style="margin-top:18px;">Saved Settings Payload</div>
+        <pre class="summary">{{ result.settings | tojson(indent=2) }}</pre>
+        <p class="muted">จัดการเจ้าของเพิ่มเติมได้ที่ <a href="/admin/oa/owners?shop_id={{ result.shop_id }}">/admin/oa/owners?shop_id={{ result.shop_id }}</a></p>
+      </div>
+    {% endif %}
+  </div>
+</body>
+</html>

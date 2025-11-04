@@ -1,0 +1,145 @@
+{% extends "admin/base.html" %}
+{% block title %}ขอรายงาน — {{ shop_id }}{% endblock %}
+{% block header %}ขอรายงาน On-Demand — {{ shop_id }}{% endblock %}
+{% block content %}
+<div class="card section">
+  <form id="reqForm">
+    <div class="row">
+      <div style="flex:1 1 200px">
+        <label>ประเภทรายงาน</label>
+        <select name="kind" id="kind">
+          <option value="mini">Full Report (มีกราฟเส้น)</option>
+          <option value="full">Mini Report (4 การ์ดตัวเลข)</option>
+        </select>
+      </div>
+      <div style="flex:1 1 200px">
+        <label>เริ่มวันที่</label>
+        <input type="date" name="start_date" id="start_date" required>
+      </div>
+      <div style="flex:1 1 200px">
+        <label>ถึงวันที่</label>
+        <input type="date" name="end_date" id="end_date" required>
+      </div>
+    </div>
+    <label style="margin-top:8px">หมายเหตุ (ถ้ามี)</label>
+    <input type="text" name="note" placeholder="บันทึกเพิ่มเติม">
+    <div style="margin-top:12px">
+      <button class="btn btn-primary" type="submit">ขอรายงาน</button>
+    </div>
+    <p class="muted">* ค่าเริ่มต้นคือ 14 วันที่ผ่านมา</p>
+  </form>
+</div>
+
+<div class="card">
+  <h3 style="margin-top:0">คำขอล่าสุด</h3>
+  <div id="list"></div>
+</div>
+
+<script>
+let shopId = "{{ shop_id or '' }}";
+const listEl = document.getElementById("list");
+const formEl = document.getElementById("reqForm");
+const startEl = document.getElementById("start_date");
+const endEl = document.getElementById("end_date");
+
+// ตั้งค่าเริ่มต้น = 14 วันล่าสุด
+(function initDates(){
+  const today = new Date();
+  const end = new Date(today.getFullYear(), today.getMonth(), today.getDate());
+  const start = new Date(end); start.setDate(end.getDate() - 13);
+  const toYMD = d => d.toISOString().slice(0,10);
+  startEl.value = toYMD(start);
+  endEl.value = toYMD(end);
+})();
+
+function setFormDisabled(flag){
+  try{
+    const elements = Array.from(formEl.elements || []);
+    for(const el of elements){
+      el.disabled = !!flag;
+    }
+  }catch(err){
+    console.warn("setFormDisabled failed", err);
+  }
+}
+
+async function ensureShopId(){
+  if(shopId){
+    return shopId;
+  }
+  try{
+    const res = await fetch("/owner/context", { credentials: "include", headers: { "Accept": "application/json" } });
+    if(!res.ok){
+      throw new Error("owner_session_missing");
+    }
+    const js = await res.json();
+    if(js && js.shop_id){
+      shopId = js.shop_id;
+      return shopId;
+    }
+    throw new Error(js && js.error ? js.error : "missing_shop_id");
+  }catch(err){
+    listEl.innerHTML = "ไม่พบสิทธิ์เจ้าของร้าน กรุณาเริ่มจากลิงก์ LIFF";
+    throw err;
+  }
+}
+
+async function refreshList(){
+  const sid = await ensureShopId();
+  listEl.innerHTML = "Loading...";
+  const res = await fetch(`/owner/${sid}/reports/requests`);
+  const js = await res.json();
+  listEl.innerHTML = (js.items||[]).map(x => `
+    <div style="border:1px solid #e5e7eb;border-radius:8px;padding:10px;margin-bottom:8px;background:#fff">
+      <div><b>ประเภท:</b> ${x.kind || "-"}</div>
+      <div><b>ช่วงเวลา:</b> ${x.start_date ? x.start_date.slice(0,10) : "-"} → ${x.end_date ? x.end_date.slice(0,10) : "-"}</div>
+      <div><b>สถานะ:</b> ${x.status}</div>
+      <div class="muted">สร้างเมื่อ: ${x.created_at || "-"}</div>
+      ${x.pdf_url ? `<div><a href="${x.pdf_url}" target="_blank">ดาวน์โหลดรายงาน</a></div>` : ``}
+    </div>
+  `).join("");
+}
+formEl.addEventListener('submit', async (e) => {
+  e.preventDefault();
+  const btn = formEl.querySelector('button[type="submit"]');
+  const originalText = btn.textContent;
+  btn.disabled = true; btn.textContent = 'กำลังสร้างรายงาน...';
+  try {
+    const sid = await ensureShopId();
+    const fd = new FormData(formEl);
+    const body = {}; for (const [k,v] of fd.entries()) body[k]=v;
+    // 1) Create request
+    const resCreate = await fetch(`/owner/${sid}/reports/requests`, {
+      method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify(body)
+    });
+    const jsCreate = await resCreate.json();
+    if(!resCreate.ok || !jsCreate.ok){ throw new Error('สร้างคำขอไม่สำเร็จ'); }
+    const reqId = jsCreate.request_id;
+    // 2) Run report immediately
+    const resRun = await fetch(`/owner/${sid}/reports/requests/${reqId}/run`, { method: 'POST' });
+    const jsRun = await resRun.json();
+    if(!resRun.ok || !jsRun.ok){ throw new Error(jsRun.error || 'ประมวลผลรายงานไม่สำเร็จ'); }
+    // 3) Open result in new tab and refresh list
+    if(jsRun.pdf_url){ window.open(jsRun.pdf_url, '_blank'); }
+    await refreshList();
+    formEl.reset();
+  } catch (err){
+    alert(err.message || 'เกิดข้อผิดพลาด');
+  } finally {
+    btn.disabled = false; btn.textContent = originalText;
+  }
+});
+
+setFormDisabled(true);
+(async function init(){
+  try{
+    await ensureShopId();
+    setFormDisabled(false);
+    await refreshList();
+  }catch(err){
+    console.error("initialization failed", err);
+    alert('ไม่พบสิทธิ์เจ้าของร้าน กรุณาเปิดผ่าน LIFF อีกครั้ง');
+  }
+})();
+</script>
+{% endblock %}

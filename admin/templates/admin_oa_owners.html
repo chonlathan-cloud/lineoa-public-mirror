@@ -1,0 +1,161 @@
+<!doctype html>
+<html lang="th">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>จัดการเจ้าของร้าน</title>
+  <style>
+    body{margin:0;font:15px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",Helvetica,Arial,sans-serif;background:#f5f7fb;color:#1f2937}
+    .wrap{max-width:960px;margin:0 auto;padding:24px 16px 64px}
+    h1{margin:0 0 18px;font-size:24px}
+    .card{background:#fff;border:1px solid #e5e7eb;border-radius:14px;padding:18px;margin-bottom:18px;box-shadow:0 12px 30px -22px rgba(15,23,42,.4)}
+    label{display:block;font-weight:600;margin-bottom:6px}
+    input[type=text]{width:100%;padding:10px 12px;border:1px solid #d1d5db;border-radius:10px;font:inherit}
+    button{padding:10px 16px;border-radius:10px;border:none;background:#2563eb;color:#fff;font-weight:600;cursor:pointer}
+    button.secondary{background:#e5e7eb;color:#111;margin-left:6px}
+    table{width:100%;border-collapse:collapse;margin-top:12px}
+    th,td{border:1px solid #e5e7eb;padding:10px;font-size:14px;text-align:left}
+    th{background:#f8fafc}
+    .muted{color:#6b7280;font-size:13px}
+    .alert{background:#fee2e2;border:1px solid #fecaca;padding:10px 14px;border-radius:10px;color:#b91c1c;margin-bottom:14px}
+    .notice{background:#dcfce7;border:1px solid #bbf7d0;padding:10px 14px;border-radius:10px;color:#166534;margin-bottom:14px}
+    .summary{background:#f1f5f9;border-radius:12px;padding:14px;font-size:14px;overflow:auto}
+    .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:12px}
+    @media(max-width:640px){table{display:block;overflow-x:auto}}
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <h1>จัดการเจ้าของร้าน</h1>
+    <div class="card" style="margin-top:12px;">
+      <h2 style="margin:0 0 8px 0;">Webhook URL (Consumer)</h2>
+      <div class="summary">
+        <code>https://lineoa-consumer-250878482242.asia-southeast1.run.app/line/webhook</code>
+      </div>
+      <p class="muted" style="margin-top:8px;">This is the actual webhook endpoint your LINE OA should use.</p>
+    </div>
+
+    {% if errors %}
+      <div class="alert">
+        <ul style="margin:0 0 0 18px;padding:0;">
+          {% for err in errors %}
+            <li>{{ err }}</li>
+          {% endfor %}
+        </ul>
+      </div>
+    {% endif %}
+
+    {% if message %}
+      <div class="notice">{{ message }}</div>
+    {% endif %}
+
+    <div class="card">
+      <form method="get">
+        <label>Shop ID</label>
+        <div class="grid" style="align-items:end;">
+          <div><input type="text" name="shop_id" value="{{ shop_id }}" placeholder="เช่น shop_00012"></div>
+          <div><button type="submit">โหลดข้อมูล</button></div>
+        </div>
+        <p class="muted">ระบุ shop_id แล้วกดโหลดเพื่อดูเจ้าของและลิงก์เชิญ</p>
+      </form>
+    </div>
+
+    {% if shop_id %}
+      <div class="card">
+        <h2 style="margin-top:0;">เชิญเจ้าของร้าน</h2>
+        <form method="post">
+          <input type="hidden" name="action" value="create">
+          <input type="hidden" name="shop_id" value="{{ shop_id }}">
+          <label>LINE User ID (ถ้ามี)</label>
+          <input type="text" name="messaging_user_id" placeholder="Uxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx">
+          <p class="muted">ถ้ามี LINE user id ระบบจะส่งลิงก์อัตโนมัติ (ถ้าไม่ระบุ สามารถคัดลอกลิงก์ที่ได้ไปส่งเอง)</p>
+          <button type="submit">สร้างลิงก์เชิญ</button>
+        </form>
+        {% if invite_result %}
+          <div class="summary" style="margin-top:12px;">
+            <div><strong>ลิงก์:</strong> <a href="{{ invite_result.url }}" target="_blank">{{ invite_result.url }}</a></div>
+            <div><strong>Token:</strong> {{ invite_result.token }}</div>
+            <div><strong>jti:</strong> {{ invite_result.jti }}</div>
+            <div><strong>หมดอายุ:</strong> {{ invite_result.exp }}</div>
+            {% if invite_result.messaging_user_id %}
+              <div><strong>ส่งถึง:</strong> {{ invite_result.messaging_user_id }}</div>
+            {% endif %}
+            <div><strong>สถานะส่ง:</strong>
+              {% if invite_result.pushed %}
+                <span style="color:#0f766e;">ส่งผ่าน LINE แล้ว</span>
+              {% elif invite_result.push_error %}
+                <span style="color:#b91c1c;">ล้มเหลว ({{ invite_result.push_error }})</span>
+              {% else %}
+                <span class="muted">ยังไม่ได้ส่ง</span>
+              {% endif %}
+            </div>
+          </div>
+        {% endif %}
+      </div>
+
+      <div class="card">
+        <h2 style="margin-top:0;">เจ้าของร้านปัจจุบัน</h2>
+        {% if owners %}
+          <table>
+            <thead><tr><th>global_sub</th><th>สถานะ</th><th>บทบาท</th><th>เชื่อมเมื่อ</th></tr></thead>
+            <tbody>
+              {% for o in owners %}
+                <tr>
+                  <td>{{ o.id }}</td>
+                  <td>{{ "active" if o.active else "inactive" }}</td>
+                  <td>{{ o.roles|join(", ") }}</td>
+                  <td>{{ o.linked_at or "-" }}</td>
+                </tr>
+              {% endfor %}
+            </tbody>
+          </table>
+        {% else %}
+          <p class="muted">ยังไม่มีเจ้าของร้าน</p>
+        {% endif %}
+      </div>
+
+      <div class="card">
+        <h2 style="margin-top:0;">ลิงก์เชิญ / การเข้าถึง</h2>
+        {% if magic_links %}
+          <table>
+            <thead><tr><th>jti</th><th>LINE User</th><th>สร้างเมื่อ</th><th>หมดอายุ</th><th>สถานะ</th><th>การจัดการ</th></tr></thead>
+            <tbody>
+              {% for link in magic_links %}
+                <tr>
+                  <td>{{ link.jti }}</td>
+                  <td>{{ link.target_user_id or "-" }}</td>
+                  <td>{{ link.created_at or "-" }}</td>
+                  <td>{{ link.exp or "-" }}</td>
+                  <td>
+                    {% if link.revoked %}
+                      <span style="color:#b91c1c;">ยกเลิกแล้ว</span>
+                    {% elif link.used_at %}
+                      <span style="color:#0f766e;">ใช้แล้ว ({{ link.used_at }})</span>
+                    {% else %}
+                      <span class="muted">ยังไม่ใช้</span>
+                    {% endif %}
+                  </td>
+                  <td>
+                    {% if not link.revoked and not link.used_at %}
+                      <form method="post" style="display:inline;">
+                        <input type="hidden" name="action" value="revoke">
+                        <input type="hidden" name="shop_id" value="{{ shop_id }}">
+                        <input type="hidden" name="jti" value="{{ link.jti }}">
+                        <button type="submit" class="secondary">ยกเลิก</button>
+                      </form>
+                    {% else %}
+                      -
+                    {% endif %}
+                  </td>
+                </tr>
+              {% endfor %}
+            </tbody>
+          </table>
+        {% else %}
+          <p class="muted">ยังไม่มีลิงก์เชิญ</p>
+        {% endif %}
+      </div>
+    {% endif %}
+  </div>
+</body>
+</html>

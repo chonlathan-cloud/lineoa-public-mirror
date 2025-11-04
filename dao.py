@@ -22,7 +22,45 @@ def _ensure_aware_utc(dt: datetime) -> datetime:
         return dt.replace(tzinfo=timezone.utc)
     return dt
 
+
 # ---------- shops / settings ----------
+
+# Canonical: settings/default under each shop
+def get_shop_settings(shop_id: str) -> Optional[Dict[str, Any]]:
+    """Return shops/{shopId}/settings/default as a dict, or None if missing."""
+    db = get_db()
+    snap = (
+        db.collection("shops").document(shop_id)
+          .collection("settings").document("default")
+          .get()
+    )
+    return snap.to_dict() if snap.exists else None
+
+def set_shop_settings(shop_id: str, data: Dict[str, Any], merge: bool = True) -> None:
+    """Upsert fields into shops/{shopId}/settings/default."""
+    if not data:
+        return
+    db = get_db()
+    (
+        db.collection("shops").document(shop_id)
+          .collection("settings").document("default")
+          .set(data, merge=merge)
+    )
+
+def get_shop_settings_value(shop_id: str, key: str, default: Any = None) -> Any:
+    """Convenience: read one key from settings/default."""
+    s = get_shop_settings(shop_id) or {}
+    return s.get(key, default)
+
+def set_shop_bot_user_id(shop_id: str, bot_user_id: str) -> None:
+    """Persist mapping bot_user_id -> shops/{shopId} at top-level shop document for fast lookup."""
+    db = get_db()
+    db.collection("shops").document(shop_id).set({"bot_user_id": bot_user_id}, merge=True)
+
+def set_shop_line_oa_id(shop_id: str, line_oa_id: str) -> None:
+    """Persist mapping line_oa_id -> shops/{shopId} at top-level shop document for fast lookup."""
+    db = get_db()
+    db.collection("shops").document(shop_id).set({"line_oa_id": line_oa_id}, merge=True)
 
 def get_shop(shop_id: str) -> Optional[Dict[str, Any]]:
     db = get_db()
@@ -210,17 +248,58 @@ def list_messages(
     return items
 
 # ---------- products ----------
-
 def list_products(shop_id: str, limit: int = 100) -> List[Dict[str, Any]]:
     db = get_db()
-    q = (
-        db.collection("shops").document(shop_id)
-          .collection("products")
-          .where("is_active", "==", True)
-          .order_by("created_at", direction=firestore.Query.DESCENDING)
-          .limit(limit)
-    )
-    return [doc.to_dict() | {"_id": doc.id} for doc in q.stream()]
+    col = db.collection("shops").document(shop_id).collection("products")
+    items: List[Dict[str, Any]] = []
+
+    # Primary: is_active == True
+    try:
+        q1 = (
+            col.where("is_active", "==", True)
+               .order_by("created_at", direction=firestore.Query.DESCENDING)
+               .limit(limit)
+        )
+        docs1 = list(q1.stream())
+    except Exception:
+        docs1 = []
+
+    if docs1:
+        for d in docs1:
+            items.append(d.to_dict() | {"_id": d.id})
+        return items
+
+    # Fallback: status == "active"
+    try:
+        q2 = (
+            col.where("status", "==", "active")
+               .order_by("created_at", direction=firestore.Query.DESCENDING)
+               .limit(limit)
+        )
+        docs2 = list(q2.stream())
+    except Exception:
+        docs2 = []
+
+    if docs2:
+        for d in docs2:
+            items.append(d.to_dict() | {"_id": d.id})
+        return items
+
+    # Last resort: recent docs, filter in memory
+    try:
+        q3 = col.order_by("created_at", direction=firestore.Query.DESCENDING).limit(limit * 2)
+        for d in q3.stream():
+            data = d.to_dict() or {}
+            is_active = data.get("is_active")
+            status = (data.get("status") or "").lower()
+            if (is_active is True) or (status == "active"):
+                items.append(data | {"_id": d.id})
+                if len(items) >= limit:
+                    break
+    except Exception:
+        pass
+
+    return items
 
 # ---------- promotions ----------
 
@@ -242,7 +321,6 @@ def list_promotions(shop_id: str, status: Optional[str] = None, limit: int = 50)
                 data[k] = v.isoformat()
         items.append(data)
     return items
-
 # ---------- customers (listing) ----------
 
 def list_customers(shop_id: str, limit: int = 100, before: Optional[str] = None) -> List[Dict[str, Any]]:
@@ -330,6 +408,46 @@ def upsert_owner_profile(
 def get_owner_profile(shop_id: str) -> Optional[Dict[str, Any]]:
     db = get_db()
     snap = db.collection("shops").document(shop_id).collection("owner_profile").document("default").get()
+    return snap.to_dict() if snap.exists else None
+
+
+# ---------- owner_profile/information (bootstrap data for creating B's OA) ----------
+def upsert_owner_information(
+    shop_id: str,
+    location: Optional[Dict[str, Any]] = None,
+    phone: Optional[str] = None,
+    **extra: Any,
+) -> None:
+    """
+    Upsert to shops/{shopId}/owner_profile/information.
+    Known fields: location, phone, and any extra metadata for provisioning OA B.
+    """
+    db = get_db()
+    data: Dict[str, Any] = {}
+    if location is not None:
+        data["location"] = location
+    if phone is not None:
+        data["phone"] = phone
+    # include other provided fields as-is (e.g., business_hours, notes)
+    for k, v in (extra or {}).items():
+        if v is not None:
+            data[k] = v
+    if not data:
+        return
+    (
+        db.collection("shops").document(shop_id)
+          .collection("owner_profile").document("information")
+          .set(data, merge=True)
+    )
+
+def get_owner_information(shop_id: str) -> Optional[Dict[str, Any]]:
+    """Return shops/{shopId}/owner_profile/information as a dict, or None if missing."""
+    db = get_db()
+    snap = (
+        db.collection("shops").document(shop_id)
+          .collection("owner_profile").document("information")
+          .get()
+    )
     return snap.to_dict() if snap.exists else None
 
 

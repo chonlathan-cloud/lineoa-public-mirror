@@ -1,0 +1,144 @@
+import uuid, logging, os
+from datetime import datetime, timezone
+from typing import Optional, Dict, Any
+from google.cloud import storage, firestore
+from firestore_client import get_db
+from urllib.parse import quote
+
+MEDIA_BUCKET = os.getenv("MEDIA_BUCKET")
+MEDIA_PUBLIC_BASE = os.getenv("MEDIA_PUBLIC_BASE")
+
+def _now():
+    return datetime.now(timezone.utc)
+
+def _sessions():
+    return get_db().collection("onboarding").document("sessions").collection("users")
+
+def _requests():
+    return get_db().collection("onboarding").document("requests").collection("items")
+
+def _payload_fingerprint(data: Dict[str, Any]) -> str:
+    name = (data.get("name") or "").strip()
+    phone = (data.get("phone") or "").strip()
+    shop = (data.get("shop") or "").strip()
+    loc = data.get("location") or {}
+    loc_key = f"{loc.get('lat')}|{loc.get('lng')}|{loc.get('address')}"
+    logo = (data.get("logo_url") or "").strip()
+    return f"{name}|{phone}|{shop}|{loc_key}|{logo}"
+
+def get_session(user_id: str) -> Dict[str, Any]:
+    snap = _sessions().document(user_id).get()
+    return snap.to_dict() if snap.exists else {}
+
+def save_session(user_id: str, data: Dict[str, Any]):
+    data["updated_at"] = _now()
+    _sessions().document(user_id).set(data, merge=True)
+
+def clear_session(user_id: str):
+    _sessions().document(user_id).delete()
+
+def upload_logo_bytes(user_id: str, content: bytes, content_type: Optional[str]) -> Optional[str]:
+    if not MEDIA_BUCKET or not content:
+        return None
+    try:
+        client = storage.Client()
+        bucket = client.bucket(MEDIA_BUCKET)
+        blob_name = f"shops/_onboarding/{user_id}/{uuid.uuid4().hex}.jpg"
+        blob = bucket.blob(blob_name)
+        try:
+            blob.cache_control = "public, max-age=86400"
+        except Exception:
+            pass
+        blob.upload_from_string(content, content_type=content_type or "image/jpeg")
+        base = MEDIA_PUBLIC_BASE or f"https://storage.googleapis.com/{MEDIA_BUCKET}"
+        return f"{base}/{blob_name}"
+    except Exception as e:
+        logging.getLogger("onboarding").error("upload_logo_bytes failed: %s", e)
+        return None
+
+def finalize_request_from_session(user_id: str) -> Optional[str]:
+    s = get_session(user_id)
+    if not s or not s.get("name") or not s.get("phone") or not s.get("shop"):
+        return None
+    fp = _payload_fingerprint(s)
+    now = _now()
+    logger = logging.getLogger("onboarding")
+    try:
+        q = (
+            get_db()
+            .collection("onboarding")
+            .document("requests")
+            .collection("items")
+            .where("user_id", "==", user_id)
+            .limit(25)
+        )
+        for doc in q.stream():
+            data = doc.to_dict() or {}
+            if data.get("status") == "pending" and data.get("fingerprint") == fp:
+                _requests().document(doc.id).set({
+                    "last_submitted_at": now,
+                    "updated_at": now,
+                }, merge=True)
+                return doc.id
+    except Exception as e:
+        logger.warning("finalize_request dedupe failed: %s", e)
+    req_id = uuid.uuid4().hex
+    payload = {
+        "user_id": user_id,
+        "messaging_user_id": s.get("messaging_user_id") or user_id,
+        "name": s.get("name"),
+        "phone": s.get("phone"),
+        "shop": s.get("shop"),
+        "location": s.get("location"),
+        "logo_url": s.get("logo_url"),
+        "status": "pending",
+        "created_at": now,
+        "updated_at": now,
+        "fingerprint": fp,
+        "source": "OA-Admin(A>B)",
+    }
+    _requests().document(req_id).set(payload, merge=False)
+    return req_id
+
+def to_flex_summary(session: Dict[str, Any]) -> Dict[str, Any]:
+    shop = session.get("shop") or "(ไม่ระบุชื่อร้าน)"
+    name = session.get("name") or "-"
+    phone = session.get("phone") or "-"
+    address = (session.get("location") or {}).get("address") or "ธุรกิจออนไลน์ ไม่มีหน้าร้าน"
+    safe = quote(shop, safe="")
+    logo_url = session.get("logo_url") or f"https://dummyimage.com/600x400/cccccc/000000&text={safe}"
+    return {
+      "type": "flex",
+      "altText": "สรุปข้อมูลร้านค้า",
+      "contents": {
+        "type": "bubble",
+        "hero": {"type":"image","url":logo_url,"size":"full","aspectRatio":"20:13","aspectMode":"cover"},
+        "body": {
+          "type":"box","layout":"vertical","contents":[
+            {"type":"text","text":shop,"weight":"bold","size":"xl","color":"#1DB446"},
+            {"type":"text","text":"บัญชีร้านค้าอย่างเป็นทางการ","size":"sm","color":"#888","margin":"sm"},
+            {"type":"separator","margin":"md"},
+            {"type":"box","layout":"vertical","margin":"md","spacing":"sm","contents":[
+              {"type":"text","text":"ข้อมูลร้านค้า","weight":"bold","size":"md","color":"#000","margin":"sm"},
+              {"type":"box","layout":"vertical","spacing":"xs","contents":[
+                {"type":"box","layout":"baseline","spacing":"sm","contents":[
+                  {"type":"text","text":"ชื่อผู้ติดต่อ","color":"#aaa","size":"sm","flex":2},
+                  {"type":"text","text":name,"wrap":True,"size":"sm","flex":4}]},
+                {"type":"box","layout":"baseline","spacing":"sm","contents":[
+                  {"type":"text","text":"เบอร์โทร","color":"#aaa","size":"sm","flex":2},
+                  {"type":"text","text":phone,"wrap":True,"size":"sm","flex":4}]},
+                {"type":"box","layout":"baseline","spacing":"sm","contents":[
+                  {"type":"text","text":"ที่อยู่ร้าน","color":"#aaa","size":"sm","flex":2},
+                  {"type":"text","text":address,"wrap":True,"size":"sm","flex":4,"color":"#444"}]}
+              ]}
+            ]},
+            {"type":"separator","margin":"xl"},
+            {"type":"text","text":"💬 ส่งโลโก้ร้าน/เมนู/ช่องทางชำระเงิน เพิ่มเติมได้ในแชทนี้","wrap":True,"size":"xs","color":"#888","margin":"lg","align":"center"}
+          ]
+        },
+        "footer":{"type":"box","layout":"vertical","contents":[
+          {"type":"button","style":"primary","color":"#1DB446","height":"sm",
+           "action":{"type":"message","label":"ยืนยันข้อมูล","text":"ยืนยันข้อมูล"}}
+        ],"flex":0}
+      }
+    }

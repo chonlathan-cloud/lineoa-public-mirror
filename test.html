@@ -1,0 +1,419 @@
+html = f"""<!doctype html>
+<html lang="th">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{REPORT_TITLE_EN}</title>
+<style>
+  {font_css}
+  :root {{
+    --teal: {BRAND_PRIMARY_HEX};
+    --orange: {BRAND_ACCENT_HEX};
+    --offwhite: #F8F9FA;
+    --lightgray: #F5F5F4;
+    --text: #111827;
+  }}
+  * {{ box-sizing: border-box; }}
+  body {{
+    margin: 0; padding: 28px; background: linear-gradient(180deg, #f5f7fa 0%, #ffffff 70%);
+    color: var(--text);
+    font-family: 'ThaiBrand', ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial;
+  }}
+  .container {{
+    max-width: 1040px; margin: 0 auto; display: flex; flex-direction: column; gap: 24px;
+  }}
+  .title {{
+    position: relative;
+    background: linear-gradient(135deg, var(--teal), #006a6a);
+    color: white; padding: 32px 36px; border-radius: 22px;
+    box-shadow: 0 20px 48px rgba(0,0,0,0.18);
+    overflow: hidden; display:flex; flex-direction:column; gap:18px;
+  }}
+  .title::after {{
+    content:""; position:absolute; inset:0;
+    background: radial-gradient(circle at top right, rgba(255,255,255,0.35), transparent 55%);
+    mix-blend-mode: screen;
+  }}
+  .title-head {{ position:relative; z-index:1; }}
+  h1 {{ margin: 0; font-size: 30px; letter-spacing: .3px; }}
+  .title-meta {{
+    position:relative; z-index:1; display:flex; flex-wrap:wrap; gap:12px 20px; align-items:center;
+    font-size:14px; opacity:.92;
+  }}
+  .subtitle {{ margin:0; }}
+  .grid {{ display: grid; gap: 20px; }}
+  .cards {{ grid-template-columns: repeat(2, minmax(0, 1fr)); }}
+  .card {{
+    position:relative;
+    padding: 22px; border-radius: 20px; background: white;
+    box-shadow: 0 18px 40px rgba(0,128,128,0.12);
+    border: 1px solid rgba(0,128,128,0.08);
+    display: flex; flex-direction: column; gap: 10px; min-height: 130px;
+  }}
+  .card::after {{
+    content:""; position:absolute; inset:0;
+    border-radius: inherit;
+    background: linear-gradient(140deg, rgba(255,255,255,0.25), transparent 45%);
+    opacity:0; transition: opacity .25s ease;
+  }}
+  .card:hover::after {{ opacity:1; }}
+  .card h3 {{ margin: 0; font-weight: 600; font-size: 14px; color: #374151; letter-spacing:.2px; }}
+  .card .value {{ font-size: 32px; font-weight: 700; color:#0f172a; }}
+  .card small {{ font-size: 12px; color: #4B5563; display:flex; align-items:center; gap:6px; }}
+  .card small::before {{
+    content:""; width:6px; height:6px; border-radius:999px; background: rgba(17,24,39,0.38);
+  }}
+  .card--1 {{ background: linear-gradient(135deg, #E6FFFB, #F6FFFD); }}
+  .card--2 {{ background: linear-gradient(135deg, #FFF7ED, #FFF2E6); }}
+  .card--3 {{ background: linear-gradient(135deg, #EEF2FF, #F4F6FF); }}
+  .card--4 {{ background: linear-gradient(135deg, #ECFDF5, #F4FFF9); }}
+  .insights {{ display:grid; gap:20px; margin-top:8px; }}
+  .insight-card {{
+    position:relative;
+    background: linear-gradient(180deg, #ffffff, #fafafa);
+    border: 1px solid rgba(249,115,22,0.25); border-radius: 20px; padding: 22px 24px;
+    box-shadow: 0 22px 36px rgba(249,115,22,.18);
+    overflow:hidden;
+  }}
+  .insight-card::before {{
+    content:""; position:absolute; inset:0;
+    background: radial-gradient(circle at top left, rgba(249,115,22,0.18), transparent 55%);
+  }}
+  .insight-card > * {{ position:relative; z-index:1; }}
+  .insight-title {{ font-weight:700; font-size:16px; margin:0 0 8px 0; }}
+  .insight-body {{ margin:0; color:#374151; line-height:1.6; }}
+  .badge {{ display:inline-block; background: var(--orange); color:white; padding:4px 8px; border-radius: 999px; font-size: 12px; margin-left:8px; }}
+  .footer {{ text-align:right; color:#E5F5F4; font-size:12px; margin-top:0; position:relative; z-index:1; }}
+  @media (max-width: 900px) {{
+    body {{ padding: 18px; }}
+    .cards {{ grid-template-columns: 1fr; }}
+  }}
+  @media print {{
+    body {{ background: white; padding: 0; }}
+    .title {{ border-radius: 0; }}
+    .card, .section, .insight-card {{ box-shadow: none; }}
+    .container {{ max-width: unset; padding: 16mm; }}
+  }}
+</style>
+</head>
+<body>
+  <div class="container">
+    <div class="title">
+      <div class="title-head">
+        <h1>{REPORT_TITLE_TH}</h1>
+      </div>
+      <div class="title-meta">
+        <div class="subtitle">{REPORT_TITLE_EN} • Period: {period_txt}</div>
+      </div>
+    </div>
+
+    <!-- Top 4 colored cards -->
+    <div class="grid cards">
+      <div class="card card--1">
+        <h3>Total Customers</h3>
+        <div class="value">{_fmt_int(k_total)}</div>
+        <small>{_pct(k_total, p.get('total_customers'))}</small>
+      </div>
+      <div class="card card--2">
+        <h3>New Customers</h3>
+        <div class="value">{_fmt_int(k_new)}</div>
+        <small>{_pct(k_new, p.get('new_customers'))}</small>
+      </div>
+      <div class="card card--3">
+        <h3>Active Chat Users</h3>
+        <div class="value">{_fmt_int(k_act)}</div>
+        <small>{_pct(k_act, p.get('active_chat_users'))}</small>
+      </div>
+      <div class="card card--4">
+        <h3>Revenue (THB)</h3>
+        <div class="value">{_fmt_money(k_rev)}</div>
+        <small>{_pct(k_rev, p.get('revenue'))}</small>
+      </div>
+    </div>
+
+    <!-- Insights -->
+    <div class="insights">
+      {"".join(f'<div class="insight-card"><div class="insight-title">🔎 Insight</div><p class="insight-body">{i}</p></div>' for i in insights)}
+    </div>
+
+    <div class="footer">Prepared by AI for Org • Shop: {shop_id}</div>
+  </div>
+</body>
+</html>"""
+
+
+   html = f"""<!doctype html>
+<html lang="th">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{REPORT_TITLE_EN} • Mini Snapshot</title>
+<style>
+  {font_css}
+  :root {{
+    --teal: {BRAND_PRIMARY_HEX};
+    --orange: {BRAND_ACCENT_HEX};
+    --offwhite: #F8F9FA;
+    --lightgray: #F5F5F4;
+    --text: #111827;
+  }}
+
+* {{ box-sizing: border-box; }}
+  body {{
+    margin: 0; padding: 1px; background: var(--offwhite); color: var(--text); /* ลด padding ของ body */
+    font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial;
+  }}
+  .container {{ max-width: 1200px; margin: 0 auto; border-radius: 12px; display: grid; gap: 3px; }} /* ขยายความกว้างและจัดกลาง */
+  .title {{
+    background: var(--teal);
+    color: white; padding: 16px 20px; border-radius: 12px 12px 0 0; /* เพิ่มความโค้งมนให้ขอบบน */
+    box-shadow: 0 8px 20px rgba(0,0,0,.12);
+  }}
+  .title h1 {{ margin: 0; font-size: 24px; letter-spacing: .3px; }}
+  .subtitle {{ margin: 6px 0 0; font-size: 13px; opacity: .9; }}
+  .grid {{ display: grid; gap: 5px; }} /* ลด gap ของ grid */
+  .cards {{ grid-template-columns: repeat(2, 1fr); margin-top: 5px; }} /* ลด margin-top ของ cards */
+  .card {{
+    padding: 12px; border-radius: 12px; background: white; /* ลด padding ของ card */
+    box-shadow: 0 2px 8px rgba(0,0,0,.06);
+    display: flex; flex-direction: column; gap: 8px; min-height: 90px; /* จัดกลางและลด gap */
+    border: 1px solid rgba(0,0,0,0.04);
+  }}
+  .card h3 {{ margin: 0; font-weight: 500; font-size: 12px; color: #374151; }}
+  .card .value {{ font-size: 18px; font-weight: 700; align-items:center;}}
+  .card small {{ font-size: 14px; color: #4B5563; }}
+  .card--1 {{ background: #E6FFFB; }}
+  .card--2 {{ background: #FFF7ED; }}
+  .card--3 {{ background: #EEF2FF; }}
+  .card--4 {{ background: #ECFDF5; }}
+  .section {{ background: white; padding: 12px; border-radius: 14px; box-shadow: 0 2px 8px rgba(0,0,0,.06); }} /* ลด padding ของ section */
+  .section h2 {{ margin: 0 0 8px 0; font-size: 16px; }}
+  .legend {{ display:flex; gap:12px; align-items:center; margin-bottom: 10px; font-size:12px; color:#4B5563; }}
+  .legend span {{ display:inline-flex; align-items:center; gap:6px; }}
+  .dot {{ width:10px; height:10px; border-radius:999px; display:inline-block; }}
+  .chart-wrapper img {{ width: 100%; height: auto; border-radius: 12px; box-shadow: 0 2px 8px rgba(0,0,0,.04); }}
+  .chart-empty {{ font-size: 13px; color: #6B7280; padding: 24px 0; text-align: center; }}
+  .insights {{ display:grid; gap:10px; margin-top:10px; }} /* ลด gap และ margin-top ของ insights */
+  .insight-card {{
+    background: linear-gradient(180deg, #ffffff, #fafafa);
+    border: 1px solid #E5E7EB; border-radius: 14px; padding: 12px 18px;
+    box-shadow: 0 4px 14px rgba(249,115,22,.15);
+  }}
+  .insight-title {{ font-weight:700; font-size:16px; margin:10px 0 4px 0; }}
+  .insight-body {{ margin:0; color:#374151; line-height:1.6; }}
+  .badge {{ display:inline-block; background: var(--orange); color:white; padding:4px 8px; border-radius: 999px; font-size: 12px; margin-left:8px; }}
+  .footer {{ text-align:right; color:#6B7280; font-size:12px; margin-top:12px; }}
+  @media (max-width: 900px) {{
+    .cards {{ grid-template-columns: 1fr; }}
+    .two-cols {{ grid-template-columns: 1fr; }}
+  }}
+  @media print {{
+    body {{ background: white; padding: -10; }}
+    .card, .section, .insight-card {{ box-shadow: none; border: 1px solid #eee; }}
+    .container {{ max-width: unset; padding: 1mm 1mm; }} /* ปรับขอบบน/ล่าง/ข้างให้แคบลง */
+  }}
+</style>
+</head>
+<body>
+  <div class="container">
+    <div class="title">
+      <h1>Message Insights Snapshot</h1>
+      <div class="subtitle">{REPORT_TITLE_EN} • Period: {period_txt}</div>
+      <div class="subtitle">ออกรายงานวันที่ {report_date_txt} • Shop: {shop_id}</div>
+    </div>
+
+    <div class="grid cards">
+      <div class="card card--1">
+        <h3>Total Messages</h3>
+        <div class="value">{_fmt_int(total_msgs)}</div>
+        <small>{_pct(total_msgs, prev_total)}</small>
+      </div>
+      <div class="card card--2">
+        <h3>New Customers</h3>
+        <div class="value">{_fmt_int(k_new)}</div>
+        <small>{_pct(k_new, prev_new)}</small>
+      </div>
+      <div class="card card--3">
+        <h3>Total Customers</h3>
+        <div class="value">{_fmt_int(k_total)}</div>
+        <small>{_pct(k_total, prev_total_customers)}</small>
+      </div>
+      <div class="card card--4">
+        <h3>Active Chat Users</h3>
+        <div class="value">{_fmt_int(summary.get('active_chat_users', 0))}</div>
+        <small>{_pct(summary.get('active_chat_users', 0), prev_summary.get('active_chat_users') if prev_summary else 0)}</small>
+      </div>
+    </div>
+
+    <div class="section" style="margin-top:16px;">
+      <h2>Message Trend (14 days)</h2>
+      <div class="legend">
+        <span><span class="dot" style="background: var(--teal)"></span>Inbound</span>
+        <span><span class="dot" style="background: var(--orange)"></span>Outbound</span>
+      </div>
+      <div class="chart-wrapper">
+        {"<img src='" + chart_data_uri + "' alt='Message trend chart' />" if chart_data_uri else "<div class='chart-empty'>ไม่มีข้อมูลเพียงพอในการสร้างกราฟสำหรับช่วงนี้</div>"}
+      </div>
+      <div style="margin-top:10px;">
+        <h2 style="font-size:15px; margin:0 0 6px 0;">Messaging Overview</h2>
+        <p style="font-size:13px; color:#374151; line-height:1.6;">
+          มีการส่งข้อความทั้งหมด {_fmt_int(total_msgs)} ข้อความในช่วงรายงาน โดย inbound {_fmt_int(inbound)} และ outbound {_fmt_int(outbound)}.
+          แนวโน้มเทียบกับช่วงก่อนหน้า: {_pct(total_msgs, prev_total)} สำหรับข้อความรวม,
+          {_pct(inbound, prev_inbound)} สำหรับ inbound และ {_pct(outbound, prev_outbound)} สำหรับ outbound.
+        </p>
+      </div>
+      <div class="insights" style="margin-top:2px;">
+        <div class="insight-card">
+          <div class="insight-title"> Key Insight<span class="badge">Storytelling</span></div>
+          <p class="insight-body">"{key_insight}"</p>
+        </div>
+      </div>
+    </div>
+    <div class="footer">อย่าลืมกดติดตามเรา มีอะไรมาให้อัปเดตตลอดเวลา รอดูได้เลย</div>
+  </div>
+</body>
+</html>"""
+
+html = f"""<!doctype html>
+<html lang="th">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{REPORT_TITLE_EN}</title>
+<style>
+  {font_css}
+  :root {{
+    --teal: {BRAND_PRIMARY_HEX};
+    --orange: {BRAND_ACCENT_HEX};
+    --offwhite: #F8F9FA;
+    --lightgray: #F5F5F4;
+    --text: #111827;
+  }}
+  * {{ box-sizing: border-box; }}
+  body {{
+    margin: 0; padding: 28px; background: linear-gradient(180deg, #f5f7fa 0%, #ffffff 70%);
+    color: var(--text);
+    font-family: 'ThaiBrand', ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial;
+  }}
+  .container {{
+    max-width: 1040px; margin: 0 auto; display: flex; flex-direction: column; gap: 24px;
+  }}
+  .title {{
+    position: relative;
+    background: linear-gradient(135deg, var(--teal), #006a6a);
+    color: white; padding: 32px 36px; border-radius: 22px;
+    box-shadow: 0 20px 48px rgba(0,0,0,0.18);
+    overflow: hidden; display:flex; flex-direction:column; gap:18px;
+  }}
+  .title::after {{
+    content:""; position:absolute; inset:0;
+    background: radial-gradient(circle at top right, rgba(255,255,255,0.35), transparent 55%);
+    mix-blend-mode: screen;
+  }}
+  .title-head {{ position:relative; z-index:1; }}
+  h1 {{ margin: 0; font-size: 30px; letter-spacing: .3px; }}
+  .title-meta {{
+    position:relative; z-index:1; display:flex; flex-wrap:wrap; gap:12px 20px; align-items:center;
+    font-size:14px; opacity:.92;
+  }}
+  .subtitle {{ margin:0; }}
+  .grid {{ display: grid; gap: 15px; }}
+  .cards {{ grid-template-columns: repeat(2, minmax(0, 1fr)); }}
+  .card {{
+    position:relative;
+    padding: 20px; border-radius: 20px; background: white;
+    box-shadow: 0 4px 12px rgba(0, 128, 128, 0.08), 0 10px 30px rgba(0, 128, 128, 0.1);
+    border: 1px solid rgba(0,128,128,0.08);
+    display: flex; flex-direction: column; gap: 12px; min-height: 120px; 
+    align-items: center; justify-content: center; /* จัดกลางแนวนอนและแนวตั้ง */
+  }}
+  .card::after {{
+    content:""; position:absolute; inset:0;
+    border-radius: inherit;
+    background: linear-gradient(140deg, rgba(255,255,255,0.25), transparent 45%);
+    opacity:0; transition: opacity .25s ease;
+  }}
+  .card:hover::after {{ opacity:1; }}
+  .card h3 {{ margin: 0; font-weight: 600; font-size: 15px; color: #374151; letter-spacing:.2px; }}
+  .card .value {{ font-size: 34px; font-weight: 700; color:#0f172a; line-height: 1; }}
+  .card small {{ 
+    font-size: 13px; font-weight: 500; color: #4B5563; 
+    background: rgba(255,255,255,0.5); padding: 3px 8px;
+    border-radius: 99px; margin-top: 4px;
+  }}
+  .card--1 {{ background: linear-gradient(135deg, #E6FFFB, #F6FFFD); }}
+  .card--2 {{ background: linear-gradient(135deg, #FFF7ED, #FFF2E6); }}
+  .card--3 {{ background: linear-gradient(135deg, #EEF2FF, #F4F6FF); }}
+  .card--4 {{ background: linear-gradient(135deg, #ECFDF5, #F4FFF9); }}
+  .insights {{ display:grid; gap:20px; margin-top:8px; }}
+  .insight-card {{
+    position:relative;
+    background: linear-gradient(180deg, #ffffff, #fafafa);
+    border: 1px solid rgba(249,115,22,0.25); border-radius: 20px; padding: 22px 24px;
+    box-shadow: 0 22px 36px rgba(249,115,22,.18);
+    overflow:hidden;
+  }}
+  .insight-card::before {{
+    content:""; position:absolute; inset:0;
+    background: radial-gradient(circle at top left, rgba(249,115,22,0.18), transparent 55%);
+  }}
+  .insight-card > * {{ position:relative; z-index:1; }}
+  .insight-title {{ font-weight:700; font-size:16px; margin:0 0 8px 0; }}
+  .insight-body {{ margin:0; color:#374151; line-height:1.6; }}
+  .badge {{ display:inline-block; background: var(--orange); color:white; padding:4px 8px; border-radius: 999px; font-size: 12px; margin-left:8px; }}
+  .footer {{ text-align:right; color:#E5F5F4; font-size:12px; margin-top:0; position:relative; z-index:1; }}
+  @media (max-width: 900px) {{
+    body {{ padding: 18px; }}
+    .cards {{ grid-template-columns: 1fr; }}
+  }}
+  @media print {{
+    body {{ background: white; padding: 0; }}
+    .card, .section, .insight-card {{ box-shadow: none; }}
+    .container {{ max-width: unset; padding: 16mm; }}
+  }}
+</style>
+</head>
+<body>
+  <div class="container">
+    <div class="title">
+      <div class="title-head">
+        <h1>{REPORT_TITLE_TH}</h1>
+      </div>
+      <div class="title-meta">
+        <div class="subtitle">{REPORT_TITLE_EN} • Period: {period_txt}</div>
+      </div>
+    </div>
+
+    <!-- Top 4 colored cards -->
+    <div class="grid cards">
+      <div class="card card--1">
+        <h3>Total Customers</h3>
+        <div class="value">{_fmt_int(k_total)}</div>
+        <small>{_pct(k_total, p.get('total_customers'))}</small>
+      </div>
+      <div class="card card--2">
+        <h3>New Customers</h3>
+        <div class="value">{_fmt_int(k_new)}</div>
+        <small>{_pct(k_new, p.get('new_customers'))}</small>
+      </div>
+      <div class="card card--3">
+        <h3>Active Chat Users</h3>
+        <div class="value">{_fmt_int(k_act)}</div>
+        <small>{_pct(k_act, p.get('active_chat_users'))}</small>
+      </div>
+      <div class="card card--4">
+        <h3>Revenue (THB)</h3>
+        <div class="value">{_fmt_money(k_rev)}</div>
+        <small>{_pct(k_rev, p.get('revenue'))}</small>
+      </div>
+    </div>
+
+    <!-- Insights -->
+    <div class="insights">
+      {"".join(f'<div class="insight-card"><div class="insight-title"> Insight</div><p class="insight-body">{i}</p></div>' for i in insights)}
+    </div>
+
+    <div class="footer">Prepared by AI for Org • Shop: {shop_id}</div>
+  </div>
+</body>
+</html>"""

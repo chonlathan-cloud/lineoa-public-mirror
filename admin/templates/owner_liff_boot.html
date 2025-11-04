@@ -1,0 +1,93 @@
+
+<!doctype html>
+<html lang="th">
+<head>
+  <meta charset="utf-8"/>
+  <meta name="viewport" content="width=device-width,initial-scale=1"/>
+  <title>Owner Sign-in • LINE OA</title>
+  <script src="https://static.line-scdn.net/liff/edge/2/sdk.js"></script>
+  <style>
+    :root{--brand:#008080;--accent:#F97316;}
+    body{margin:0;font:14px/1.5 -apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif;background:#F8F9FA;color:#111}
+    .wrap{max-width:720px;margin:24px auto;padding:0 16px}
+    .card{background:#fff;border:1px solid #e5e7eb;border-radius:12px;padding:18px}
+    h1{margin:0 0 8px 0;font-size:18px}
+    .muted{color:#6b7280}
+    .btn{display:inline-block;background:var(--accent);color:#111;border:none;border-radius:10px;padding:10px 14px;font-weight:700;cursor:pointer}
+    #err{color:#b91c1c}
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <div class="card">
+      <h1>กำลังลงชื่อเข้าใช้…</h1>
+      <p class="muted">โปรดรอสักครู่ ระบบกำลังตรวจสอบสิทธิ์เจ้าของร้าน</p>
+      <pre id="err" style="white-space:pre-wrap"></pre>
+    </div>
+  </div>
+  <script>
+    (async function(){
+      try{
+        const LIFF_IDS = {{ liff_ids|tojson }};
+        if(!Array.isArray(LIFF_IDS) || LIFF_IDS.length === 0){
+          throw new Error("missing_liff_id");
+        }
+        let activeLiffId = null;
+        let lastError = null;
+        for(const candidate of LIFF_IDS){
+          if(!candidate){ continue; }
+          try{
+            await liff.init({ liffId: candidate, withLoginOnExternalBrowser: true });
+            activeLiffId = candidate;
+            lastError = null;
+            break;
+          }catch(err){
+            console.error("LIFF init failed", candidate, err);
+            lastError = err;
+          }
+        }
+        if(!activeLiffId){
+          throw lastError || new Error("liff_init_failed");
+        }
+        window.__activeLiffId = activeLiffId;
+        console.log("LIFF init succeeded with", activeLiffId);
+        if(!liff.isLoggedIn()){
+          liff.login();
+          return;
+        }
+        const idToken = liff.getIDToken();
+        if(!idToken){ throw new Error("no id_token from LIFF"); }
+        const params = new URLSearchParams(location.search);
+        const nextParam = params.get("next");
+        const sidParam = params.get("sid");
+        const inviteToken = params.get("token");
+        const query = new URLSearchParams();
+        if(nextParam){ query.set("next", nextParam); }
+        if(sidParam){ query.set("sid", sidParam); }
+        if(inviteToken){ query.set("token", inviteToken); }
+        const endpoint = query.toString() ? `/owner/auth/liff/callback?${query.toString()}` : "/owner/auth/liff/callback";
+        const res = await fetch(endpoint, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          credentials: "include",
+          body: JSON.stringify({
+            id_token: idToken,
+            sid: sidParam || undefined,
+            invite_token: inviteToken || undefined
+          })
+        });
+        if(!res.ok){
+          const text = await res.text();
+          throw new Error(text || "auth_failed");
+        }
+        const js = await res.json();
+        const fallback = nextParam || "/owner/promotions/form";
+        const to = (js && js.redirect) || fallback;
+        location.replace(to);
+      }catch(e){
+        document.getElementById("err").textContent = "เกิดข้อผิดพลาด: " + (e && e.message ? e.message : e);
+      }
+    })();
+  </script>
+</body>
+</html>

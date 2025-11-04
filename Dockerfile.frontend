@@ -4,6 +4,9 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1
 
 WORKDIR /app
+ # Allow selecting the Flask module at build/run time (admin vs consumer)
+ARG APP_MODULE_DEFAULT="lineoa_frontend:app"
+ENV APP_MODULE=${APP_MODULE_DEFAULT}
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
@@ -11,10 +14,11 @@ COPY . /app
 
 # Cloud Run will pass PORT; default to 8080
 ENV PORT=8080
+ENV PIP_NO_CACHE_DIR=1 PYTHONOPTIMIZE=1
 EXPOSE 8080
 
 # ใช้ gunicorn รัน Flask app (โมดูล: lineoa_frontend, ตัวแปร app)
 # -w 2: สอง worker (เพิ่ม/ลดได้ตามทราฟฟิก)
 # --threads 4: เพิ่ม concurrency
 # --timeout 60: กันงานโหลดสื่อ/Firestore นาน ๆ
-CMD ["sh","-c","gunicorn -w 2 --threads 4 --timeout 60 -b 0.0.0.0:$PORT lineoa_frontend:app"]
+CMD ["sh","-c","gunicorn -w 2 --threads 4 --timeout 60 -b 0.0.0.0:$PORT ${APP_MODULE}"]

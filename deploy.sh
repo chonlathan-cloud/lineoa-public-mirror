@@ -2,9 +2,9 @@
 set -e
 
 # Config
-REGION=asia-southeast1
-REPO=line-oa
-IMG=line-oa-api
+REGION=asia-southeast1 # Your Cloud Run region
+REPO=lineoa-repo      # Your new Artifact Registry repository
+IMG=lineoa-admin      # The image name you are building
 TAG=$(date +%s)
 
 # Require MAPS_API_KEY in your local env
@@ -15,10 +15,10 @@ if [ -z "$MAPS_API_KEY" ]; then
 fi
 
 echo "🚀 Building image with tag $TAG ..."
-gcloud builds submit --tag ${REGION}-docker.pkg.dev/lineoa-g49/${REPO}/${IMG}:${TAG}
+gcloud builds submit --tag ${REGION}-docker.pkg.dev/lineoa-g49/${REPO}/${IMG}:${TAG} --no-cache
 
 echo "🚀 Deploying to Cloud Run ..."
-gcloud run deploy line-oa-api \
+gcloud run deploy lineoa-admin \
   --image=${REGION}-docker.pkg.dev/lineoa-g49/${REPO}/${IMG}:${TAG} \
   --region=$REGION \
   --set-env-vars=API_BEARER_TOKEN=dev-secret-token,PROOF_BUCKET=lineoa-g49-proof-uploads,FRONTEND_ORIGIN=http://localhost:5173,MAPS_API_KEY=$MAPS_API_KEY

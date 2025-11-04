@@ -1,0 +1,67 @@
+<!doctype html>
+<html lang="th">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>คำขอ onboarding ร้านค้า</title>
+  <style>
+    body{margin:0;font:15px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",Helvetica,Arial,sans-serif;background:#f5f7fb;color:#1f2937}
+    .wrap{max-width:960px;margin:0 auto;padding:24px 16px 48px}
+    h1{margin:0 0 18px;font-size:24px}
+    table{width:100%;border-collapse:collapse;background:#fff;border-radius:14px;overflow:hidden;box-shadow:0 12px 30px -22px rgba(15,23,42,.6)}
+    th,td{padding:12px 14px;text-align:left;border-bottom:1px solid #e5e7eb;font-size:14px}
+    th{background:#f0f4ff;font-weight:700;color:#1e3a8a}
+    tr:last-child td{border-bottom:none}
+    a.link{color:#2563eb;text-decoration:none;font-weight:600}
+    a.link:hover{text-decoration:underline}
+    .muted{color:#6b7280;font-size:13px;margin-top:6px}
+    .alert{background:#fee2e2;border:1px solid #fca5a5;padding:10px 14px;border-radius:10px;color:#b91c1c;margin-bottom:16px}
+    @media(max-width:640px){
+      table{display:block;overflow-x:auto}
+      th,td{white-space:nowrap}
+    }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <h1>คำขอเปิดร้านที่รออนุมัติ</h1>
+    <p class="muted"><strong>Consumer Webhook:</strong> <code>https://lineoa-consumer-250878482242.asia-southeast1.run.app/line/webhook</code></p>
+    <p class="muted">เลือกรายการเพื่อ prefill ฟอร์ม <code>/admin/oa/new</code> หรือจัดการเจ้าของที่ <a href="/admin/oa/owners">/admin/oa/owners</a></p>
+    {% if error %}
+      <div class="alert">{{ error }}</div>
+    {% endif %}
+    <table>
+      <thead>
+        <tr>
+          <th>Request ID</th>
+          <th>ชื่อร้าน</th>
+          <th>ผู้ติดต่อ</th>
+          <th>เบอร์โทร</th>
+          <th>LINE User</th>
+          <th>สร้างเมื่อ</th>
+          <th>ดำเนินการ</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% if requests %}
+          {% for row in requests %}
+            <tr>
+              <td>{{ row.id }}</td>
+              <td>{{ row.shop or "-" }}</td>
+              <td>{{ row.name or "-" }}</td>
+              <td>{{ row.phone or "-" }}</td>
+              <td>{{ row.messaging_user_id or "-" }}</td>
+              <td>{{ row.created_at or "-" }}</td>
+              <td><a class="link" href="/admin/oa/new?prefill={{ row.id }}">ใช้ข้อมูลนี้</a></td>
+            </tr>
+          {% endfor %}
+        {% else %}
+          <tr>
+            <td colspan="6">ยังไม่มีคำขอรออนุมัติ</td>
+          </tr>
+        {% endif %}
+      </tbody>
+    </table>
+  </div>
+</body>
+</html>

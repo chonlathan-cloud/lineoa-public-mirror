@@ -1,0 +1,23 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Virtual env
+venv/
+.env
+.venv/
+
+# VS Code
+.vscode/
+
+# Build / dist
+build/
+dist/
+*.egg-info/
+
+# OS
+.DS_Store
+MiaGCP/
+gitpao/
