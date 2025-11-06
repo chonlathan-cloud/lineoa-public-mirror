@@ -76,6 +76,7 @@ from dao import (
     create_payment_intent, set_intent_confirm_code, 
     find_pending_intent_by_code, confirm_intent_to_payment, reject_intent_by_code,
     find_latest_pending_intent, confirm_latest_pending_intent_to_payment, reject_latest_pending_intent, attach_recent_intent_by_user,
+    find_recent_pending_magic_link, bind_owner, mark_magic_link_used,
 )
 from admin.onboarding import (
     get_session, save_session, clear_session,
@@ -284,6 +285,42 @@ def _ensure_shop_display_name(shop_id: str, access_token: Optional[str]) -> None
             upsert_owner_profile(shop_id, line_display_name=display_name)
     except Exception as e:
         logger.warning("fetch bot info failed: %s %s", e, _log_ctx(shop_id=shop_id))
+
+
+def _auto_bind_owner_if_needed(shop_id: str, user_id: str, settings: Dict[str, Any]) -> bool:
+    """
+    Try to bind owners/{user_id} from a recent shops/{shop_id}/magic_links/* with status='pending'.
+    Returns True if a new binding occurred, False otherwise.
+    """
+    if not shop_id or not user_id:
+        return False
+
+    try:
+        magic_link = find_recent_pending_magic_link(shop_id, within_hours=48)
+    except Exception:
+        return False
+
+    if not magic_link:
+        return False
+
+    liff_user_id = magic_link.get("liff_user_id")
+    jti = magic_link.get("_id")
+    if not liff_user_id or not jti:
+        return False
+
+    last_login_channel_id = None
+    try:
+        last_login_channel_id = (settings or {}).get("channel_id")
+        if not last_login_channel_id:
+            consumer = (settings or {}).get("oa_consumer")
+            if isinstance(consumer, dict):
+                last_login_channel_id = consumer.get("channel_id")
+    except Exception:
+        last_login_channel_id = None
+
+    bind_owner(shop_id, user_id, liff_user_id, last_login_channel_id=last_login_channel_id)
+    mark_magic_link_used(shop_id, jti)
+    return True
 
 def _push_payment_review_to_owners(shop_id: str, access_token: Optional[str], user_id: str, amount: float, currency: str, payment_id: str, slip_gcs_uri: Optional[str], confirm_code: str) -> None:
     if not access_token or not LineBotApi or not TextSendMessage:
@@ -922,6 +959,14 @@ def line_webhook():
                 owner = is_owner_user(shop_id, user_id)
             except Exception as e:
                 logger.warning("is_owner_user check failed: %s %s", e, _log_ctx(shop_id, user_id, event_id, message_id))
+            if not owner:
+                try:
+                    bound = _auto_bind_owner_if_needed(shop_id, user_id, settings)
+                    if bound:
+                        owner = True
+                        logger.info("auto-bind owner success %s", _log_ctx(shop_id, user_id, event_id, message_id))
+                except Exception as e:
+                    logger.warning("auto-bind failed: %s %s", e, _log_ctx(shop_id, user_id, event_id, message_id))
 
             api = None
             if access_token and LineBotApi:
@@ -956,6 +1001,25 @@ def line_webhook():
                     sess = {}
                     step = 0
 
+            owner_prompt_msg = None
+            if not owner:
+                asked_flag = bool((sess or {}).get("_asked_owner_bind"))
+                if not asked_flag and step == 0 and mtype == "text" and TextSendMessage:
+                    prompt_txt = "ยืนยันสิทธิ์เจ้าของร้านเพื่อเริ่มใช้งานได้เลยครับ"
+                    if QuickReply and QuickReplyButton and MessageAction:
+                        qr_items = [
+                            QuickReplyButton(action=MessageAction(label="ยืนยันเป็นเจ้าของร้าน", text="ยืนยันเป็นเจ้าของร้าน")),
+                            QuickReplyButton(action=MessageAction(label="ยกเลิก", text="ยกเลิก")),
+                        ]
+                        owner_prompt_msg = TextSendMessage(text=prompt_txt, quick_reply=QuickReply(items=qr_items))
+                    else:
+                        owner_prompt_msg = TextSendMessage(text=prompt_txt)
+                    sess["_asked_owner_bind"] = True
+                    try:
+                        save_session(user_id, sess)
+                    except Exception as e:
+                        logger.warning("save_session owner prompt failed: %s %s", e, _log_ctx(shop_id, user_id))
+
             def _reply_line(messages):
                 if not replyToken or not api:
                     logger.warning("skip reply (LINE client unavailable) %s", _log_ctx(shop_id, user_id, event_id))
@@ -965,6 +1029,9 @@ def line_webhook():
                     api.reply_message(replyToken, msg_list)
                 except Exception as e:
                     logger.warning("reply failed: %s %s", e, _log_ctx(shop_id, user_id, event_id, message_id))
+
+            if owner_prompt_msg and not owner:
+                _reply_line(owner_prompt_msg)
 
             def _qr_text(msg: str, add_online: bool = False):
                 if not TextSendMessage:

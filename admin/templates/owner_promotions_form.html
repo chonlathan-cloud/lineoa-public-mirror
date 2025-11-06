@@ -1,5 +1,6 @@
-{% extends "admin/base.html" %}{% block title %}จัดการโปรโมชัน/สินค้า — {{ shop_id or "-" }}{% endblock %}
-{% block header %}โปรโมชัน/สินค้า — {{ shop_id or "-" }}{% endblock %}
+{% extends "admin/base.html" %}{% set shop_label = (shop_display_name or shop_id) or "-" %}
+{% block title %}จัดการโปรโมชัน/สินค้า — {{ shop_label }}{% endblock %}
+{% block header %}โปรโมชัน/สินค้า — {{ shop_label }}{% endblock %}
 {% block content %}
 <div class="card section">
   <form id="itemForm" enctype="multipart/form-data">

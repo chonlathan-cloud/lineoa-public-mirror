@@ -42,6 +42,11 @@ try:
 except Exception:
     LineBotApi = None  # optional
     TextSendMessage = None
+try:
+    from dao import get_shop_settings, get_shop  # reuse DAO helpers when available
+except Exception:
+    get_shop_settings = None
+    get_shop = None
 # Resolve renderers: **lock to approved file** to guarantee data logic matches the meeting-approved version.
 try:
     from report_renderer import build_mini_report_pdf as render_mini_report_pdf
@@ -109,6 +114,75 @@ def _fallback_pdf_stub(shop_id: str, start_dt, end_dt) -> bytes:
     c.showPage()
     c.save()
     return buf.getvalue()
+
+
+def _resolve_shop_display_name(shop_id: Optional[str]) -> Optional[str]:
+    """Return the human-friendly shop name for UI surfaces."""
+    if not shop_id:
+        return None
+
+    settings: Dict[str, Any] = {}
+    if callable(get_shop_settings):
+        try:
+            data = get_shop_settings(shop_id)
+            if isinstance(data, dict):
+                settings = data
+        except Exception:
+            settings = {}
+    if not settings:
+        try:
+            snap = (
+                get_db().collection("shops")
+                .document(shop_id).collection("settings").document("default").get()
+            )
+            if snap.exists:
+                data = snap.to_dict()
+                if isinstance(data, dict):
+                    settings = data
+        except Exception:
+            settings = {}
+
+    def _pick_name(source: Optional[Dict[str, Any]], keys) -> Optional[str]:
+        if not isinstance(source, dict):
+            return None
+        for key in keys:
+            val = source.get(key)
+            if isinstance(val, str):
+                name = val.strip()
+                if name:
+                    return name
+        return None
+
+    name = _pick_name(settings, ("oa_display_name", "display_name", "name"))
+    if name:
+        return name
+    consumer = settings.get("oa_consumer") if isinstance(settings, dict) else None
+    name = _pick_name(consumer if isinstance(consumer, dict) else None, ("display_name", "oa_display_name", "name"))
+    if name:
+        return name
+
+    shop_meta: Dict[str, Any] = {}
+    if callable(get_shop):
+        try:
+            data = get_shop(shop_id)
+            if isinstance(data, dict):
+                shop_meta = data
+        except Exception:
+            shop_meta = {}
+    if not shop_meta:
+        try:
+            snap = get_db().collection("shops").document(shop_id).get()
+            if snap.exists:
+                data = snap.to_dict()
+                if isinstance(data, dict):
+                    shop_meta = data
+        except Exception:
+            shop_meta = {}
+
+    name = _pick_name(shop_meta, ("oa_display_name", "display_name", "name"))
+    if name:
+        return name
+    return None
 
 admin_bp = Blueprint("admin", __name__, template_folder="templates", static_folder="static")
 
@@ -936,13 +1010,18 @@ def _require_owner_auth():
 
 @admin_bp.get('/owner/<shop_id>/promotions/form')
 def owner_promo_form(shop_id):
+    display_name = _resolve_shop_display_name(shop_id)
     try:
-        return render_template('owner_promotions_form.html', shop_id=shop_id)
+        return render_template(
+            'owner_promotions_form.html',
+            shop_id=shop_id,
+            shop_display_name=display_name,
+        )
     except TemplateNotFound:
         return render_template_string('''
         <!doctype html>
         <html lang="th"><head><meta charset="utf-8"/><meta name="viewport" content="width=device-width, initial-scale=1"/>
-        <title>โปรโมชัน — {{ shop_id }}</title>
+        <title>โปรโมชัน — {{ shop_label }}</title>
         <style>
         :root{--brand:#008080;--accent:#F97316;--bg:#F8F9FA;--ink:#000}
         body{margin:0;background:var(--bg);color:var(--ink);font:14px/1.5 -apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif}
@@ -956,7 +1035,7 @@ def owner_promo_form(shop_id):
         .muted{color:#6b7280;font-size:12px}
         </style></head>
         <body>
-        <header>โปรโมชัน — {{ shop_id }}</header>
+        <header>โปรโมชัน — {{ shop_label }}</header>
         <div class="wrap">
           <div class="card">
             <form id="promoForm">
@@ -983,17 +1062,22 @@ def owner_promo_form(shop_id):
         });
         </script>
         </body></html>
-        ''', shop_id=shop_id)
+        ''', shop_label=display_name or shop_id, shop_id=shop_id)
 
 @admin_bp.get('/owner/<shop_id>/reports/request')
 def owner_report_form(shop_id):
+    display_name = _resolve_shop_display_name(shop_id)
     try:
-        return render_template('owner_report_request.html', shop_id=shop_id)
+        return render_template(
+            'owner_report_request.html',
+            shop_id=shop_id,
+            shop_display_name=display_name,
+        )
     except TemplateNotFound:
         return render_template_string('''
         <!doctype html>
         <html lang="th"><head><meta charset="utf-8"/><meta name="viewport" content="width=device-width, initial-scale=1"/>
-        <title>ขอรายงาน — {{ shop_id }}</title>
+        <title>ขอรายงาน — {{ shop_label }}</title>
         <style>
         :root{--brand:#008080;--accent:#F97316;--bg:#F8F9FA;--ink:#000}
         body{margin:0;background:var(--bg);color:var(--ink);font:14px/1.5 -apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif}
@@ -1006,7 +1090,7 @@ def owner_report_form(shop_id):
         .btn-primary{background:var(--accent);color:#111}
         </style></head>
         <body>
-        <header>ขอรายงาน — {{ shop_id }}</header>
+        <header>ขอรายงาน — {{ shop_label }}</header>
         <div class="wrap">
           <div class="card">
             <form id="reqForm">
@@ -1029,7 +1113,7 @@ def owner_report_form(shop_id):
         });
         </script>
         </body></html>
-        ''', shop_id=shop_id)
+        ''', shop_label=display_name or shop_id, shop_id=shop_id)
 def _owner_session_or_403(shop_id: str):
     sess = _get_owner_session_shop_id()
     if not sess or sess != shop_id:
@@ -1473,7 +1557,11 @@ def owner_promo_form_shortcut():
     sess_sid = request.cookies.get(OWNER_SESSION_COOKIE)
     final_sid = (sid or sess_sid) or None
     try:
-        return render_template('owner_promotions_form.html', shop_id=final_sid)
+        return render_template(
+            'owner_promotions_form.html',
+            shop_id=final_sid,
+            shop_display_name=_resolve_shop_display_name(final_sid) if final_sid else None,
+        )
     except TemplateNotFound:
         return render_template_string("&lt;p&gt;กรุณาใส่ ?sid=&lt;shop_id&gt;&lt;/p&gt;")
 

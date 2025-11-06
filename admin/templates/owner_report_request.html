@@ -1,6 +1,6 @@
-{% extends "admin/base.html" %}
-{% block title %}ขอรายงาน — {{ shop_id }}{% endblock %}
-{% block header %}ขอรายงาน On-Demand — {{ shop_id }}{% endblock %}
+{% extends "admin/base.html" %}{% set shop_label = (shop_display_name or shop_id) or "-" %}
+{% block title %}ขอรายงาน — {{ shop_label }}{% endblock %}
+{% block header %}ขอรายงาน On-Demand — {{ shop_label }}{% endblock %}
 {% block content %}
 <div class="card section">
   <form id="reqForm">
@@ -8,8 +8,8 @@
       <div style="flex:1 1 200px">
         <label>ประเภทรายงาน</label>
         <select name="kind" id="kind">
-          <option value="mini">Full Report (มีกราฟเส้น)</option>
-          <option value="full">Mini Report (4 การ์ดตัวเลข)</option>
+          <option value="full">Full Report (มีกราฟเส้น)</option>
+          <option value="mini">Mini Report (4 การ์ดตัวเลข)</option>
         </select>
       </div>
       <div style="flex:1 1 200px">

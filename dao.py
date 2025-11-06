@@ -3,7 +3,7 @@
 
 from __future__ import annotations
 from typing import Any, Dict, List, Optional
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 
 from firebase_admin import firestore as fb
 from google.cloud import firestore
@@ -85,6 +85,137 @@ def get_shop_id_by_bot_user_id(bot_user_id: str) -> Optional[str]:
     if not docs:
         return None
     return docs[0].id
+
+
+def create_magic_link(shop_id: str, jti: str, liff_user_id: str, expires_at: Optional[datetime] = None) -> None:
+    """Create/overwrite a pending magic link for this shop."""
+    if not shop_id or not jti or not liff_user_id:
+        return
+    db = get_db()
+    ref = (
+        db.collection("shops").document(shop_id)
+          .collection("magic_links").document(jti)
+    )
+    payload: Dict[str, Any] = {
+        "liff_user_id": liff_user_id,
+        "status": "pending",
+        "created_at": ts_now(),
+        "updated_at": ts_now(),
+    }
+    if expires_at is not None:
+        if isinstance(expires_at, datetime):
+            payload["expires_at"] = _ensure_aware_utc(expires_at)
+        else:
+            payload["expires_at"] = expires_at
+    ref.set(payload, merge=True)
+
+
+def mark_magic_link_used(shop_id: str, jti: str) -> None:
+    """Set status='used' and updated_at=now()."""
+    if not shop_id or not jti:
+        return
+    db = get_db()
+    (
+        db.collection("shops").document(shop_id)
+          .collection("magic_links").document(jti)
+          .set({
+              "status": "used",
+              "updated_at": ts_now(),
+              "used_at": ts_now(),
+          }, merge=True)
+    )
+
+
+def find_recent_pending_magic_link(
+    shop_id: str,
+    within_hours: int = 48
+) -> Optional[Dict[str, Any]]:
+    """Return the newest magic_link with status='pending' and not expired."""
+    if not shop_id:
+        return None
+
+    db = get_db()
+    col = (
+        db.collection("shops").document(shop_id)
+          .collection("magic_links")
+    )
+
+    try:
+        q = col.order_by("created_at", direction=firestore.Query.DESCENDING).limit(20)
+    except Exception:
+        # Fallback when index/order_by unavailable
+        q = col.limit(20)
+
+    now = datetime.now(timezone.utc)
+    threshold = now - timedelta(hours=max(1, int(within_hours or 0)))
+
+    def _as_dt(val):
+        if hasattr(val, "to_datetime"):
+            try:
+                val = val.to_datetime()
+            except Exception:
+                val = None
+        if isinstance(val, datetime):
+            return _ensure_aware_utc(val)
+        if isinstance(val, str):
+            try:
+                from dateutil import parser as _dtparser  # type: ignore
+                return _ensure_aware_utc(_dtparser.isoparse(val))
+            except Exception:
+                return None
+        return None
+
+    for doc in q.stream():
+        data = doc.to_dict() or {}
+        status = (data.get("status") or "").lower()
+        if status and status != "pending":
+            continue
+
+        created_at = _as_dt(data.get("created_at"))
+        if not created_at:
+            continue
+        if created_at and created_at < threshold:
+            continue
+        expires_at = _as_dt(data.get("expires_at"))
+        if expires_at and expires_at < now:
+            continue
+
+        result = data.copy()
+        result["_id"] = doc.id
+        if created_at:
+            result["created_at"] = created_at
+        if expires_at:
+            result["expires_at"] = expires_at
+        return result
+
+    return None
+
+
+def bind_owner(
+    shop_id: str,
+    messaging_user_id: str,
+    liff_user_id: str,
+    last_login_channel_id: Optional[str] = None
+) -> None:
+    """Create/merge owners/{messaging_user_id} with linked fields."""
+    if not shop_id or not messaging_user_id or not liff_user_id:
+        return
+
+    db = get_db()
+    ref = (
+        db.collection("shops").document(shop_id)
+          .collection("owners").document(messaging_user_id)
+    )
+    payload: Dict[str, Any] = {
+        "active": True,
+        "linked_liff_user_id": liff_user_id,
+        "linked_at": ts_now(),
+        "roles": firestore.ArrayUnion(["owner"]),
+        "updated_at": ts_now(),
+    }
+    if last_login_channel_id:
+        payload["last_login_channel_id"] = last_login_channel_id
+    ref.set(payload, merge=True)
 
 # ---------- events (idempotency) ----------
 
