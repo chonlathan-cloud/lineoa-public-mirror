@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
-BASE="$https://586db59148e8.ngrok-free.app"
+BASE="https://586db59148e8.ngrok-free.app"
 ID_TOKEN="${ID_TOKEN:?get_from_LIFF}"
 SHOP_ID="${SHOP_ID:-shop_00003}"
 pass=0; fail=0

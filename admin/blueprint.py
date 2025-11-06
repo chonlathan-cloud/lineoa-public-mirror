@@ -268,11 +268,21 @@ def _build_owner_invite_url(shop_id: str, token: str) -> str:
 # --- Helper: build add-friend link for consumer OA using basic_id ---
 def _build_consumer_add_friend_link(settings: Optional[Dict[str, Any]]) -> Optional[str]:
     """Return public add-friend URL for the consumer OA using basic_id, if available."""
+    def _normalize_basic_id(raw: Optional[str]) -> Optional[str]:
+        val = (raw or "").strip()
+        if not val:
+            return None
+        if val.startswith("@"):
+            val = val[1:]
+        return val or None
+
     try:
-        cfg = (settings or {}).get("oa_consumer") or (settings or {})
-        basic_id = (cfg.get("basic_id") or "").strip()
-        if basic_id.startswith("@"):
-            basic_id = basic_id[1:]
+        cfg = (settings or {}).get("oa_consumer")
+        if isinstance(cfg, dict):
+            basic_id = _normalize_basic_id(cfg.get("basic_id"))
+            if basic_id:
+                return f"https://page.line.me/{basic_id}"
+        basic_id = _normalize_basic_id((settings or {}).get("basic_id"))
         if basic_id:
             return f"https://page.line.me/{basic_id}"
     except Exception:
@@ -308,23 +318,36 @@ def _send_owner_invite_message(shop_id, settings, target_user_id, invite_url):
 
     try:
         add_friend_url = _build_consumer_add_friend_link(settings)
-        text_lines = [
-            "พร้อมแล้วครับ 🎉",
-            "ลิงก์เข้าสู่ระบบเจ้าของร้าน (สำหรับเข้าหน้า Owner Portal):",
-            f"{invite_url}",
-        ]
-        if add_friend_url:
-            text_lines += [
-                "\nลิงก์เพิ่มเพื่อน LINE OA ของร้าน (ส่งต่อลูกค้า/ทีมงานได้):",
-                add_friend_url,
-            ]
-        text = "\n".join(text_lines)
-        messages = [TextSendMessage(text=text)]
-        # Attach QR for consumer OA if we have its link and ImageSendMessage is available
+        messages: List[Any] = []
+        has_link = bool(add_friend_url)
+        has_qr = False
+        if add_friend_url and TextSendMessage:
+            messages.append(TextSendMessage(text=add_friend_url))
         if add_friend_url and ImageSendMessage:
             from urllib.parse import quote as _q
             qr_url = f"https://api.qrserver.com/v1/create-qr-code/?size=600x600&data={_q(add_friend_url, safe='')}"
             messages.append(ImageSendMessage(original_content_url=qr_url, preview_image_url=qr_url))
+            has_qr = True
+        thai_copy = (
+            "เพิ่มเพื่อน LINE OA ของร้านคุณจากลิงก์/QR นี้ แล้วพิมพ์ “เริ่มต้นใช้งาน”\n"
+            "เพื่อยืนยันสิทธิ์เจ้าของร้านในแชตของร้าน"
+        )
+        if TextSendMessage:
+            if has_link or has_qr:
+                messages.append(TextSendMessage(text=thai_copy))
+            else:
+                fallback = (
+                    "กรุณาเพิ่มเพื่อน LINE OA ของร้านคุณ แล้วพิมพ์ “เริ่มต้นใช้งาน”\n"
+                    "(ผู้ดูแลระบบยังไม่พบ basic_id ของ OA ร้านนี้)"
+                )
+                messages.append(TextSendMessage(text=fallback))
+                logger.info("admin-invite: basic_id missing; sent fallback text only")
+        if not messages:
+            return False, "no_messages"
+        logger.info(
+            "admin-invite: first-push consumer add-friend link present=%s qr=%s",
+            has_link, has_qr
+        )
         api.push_message(target_user_id, messages)
         return True, None
     except Exception as e:

@@ -136,7 +136,7 @@ import os as _os_boot
 if not getattr(app, "secret_key", None):
     app.secret_key = _os_boot.environ.get("FLASK_SECRET_KEY", "dev-secret-key")
 
-from admin.blueprint import admin_bp
+from admin.blueprint import admin_bp, _sign_owner_invite, _build_owner_invite_url
 # from owner.blueprint import owner_bp  # (optional; keep commented if not used)
 
 app.register_blueprint(admin_bp)
@@ -1034,11 +1034,13 @@ def line_webhook():
                 str((_oc.get("bot_user_id") or "")).strip(),
                 str((_oc.get("channel_id") or "")).strip(),
             }
-            _is_consumer_dest = line_oa_id.strip() in {x for x in _consumer_ids if x}
+            _consumer_ids = {x for x in _consumer_ids if x}
+            _dest = (line_oa_id or "").strip()
+            _is_consumer_dest = _dest in _consumer_ids
 
             logger.info(
-                "owner_prompt gate: oa_ctx=%s is_admin_start=%s is_consumer_dest=%s dest=%s shop=%s",
-                oa_ctx, is_admin_start, _is_consumer_dest, line_oa_id, shop_id
+                "owner_prompt gate: is_consumer_dest=%s oa_ctx=%s shop=%s dest=%s",
+                _is_consumer_dest, oa_ctx, shop_id, _dest
             )
 
             if _is_consumer_dest and (oa_ctx == "consumer") and (not owner) and (not is_admin_start):
@@ -1089,8 +1091,49 @@ def line_webhook():
             start_keywords = ("เริ่มต้นใช้งาน", "เริ่มต้นเปิดร้านของคุณ")
 
             if not owner and mtype == "text":
+                if (oa_ctx == "consumer") and _is_consumer_dest and (low_txt == "ยืนยันเป็นเจ้าของร้าน"):
+                    try:
+                        token, jti, _ = _sign_owner_invite(shop_id)
+                        now_utc = datetime.now(timezone.utc)
+                        db = get_db()
+                        (
+                            db.collection("shops").document(shop_id)
+                              .collection("magic_links").document(jti)
+                        ).set({
+                            "scope": "owner_invite",
+                            "target_user_id": user_id,
+                            "source": "consumer",
+                            "issued_at": now_utc,
+                            "updated_at": now_utc,
+                            "created_via": "consumer",
+                        }, merge=True)
+                        redirect_url = _build_owner_invite_url(shop_id, token)
+                        logger.info(
+                            "consumer-owner-bind: issued invite jti=%s shop=%s user=%s",
+                            jti, shop_id, user_id
+                        )
+                        if TextSendMessage and api:
+                            msg = TextSendMessage(
+                                text=f"แตะลิงก์นี้เพื่อยืนยันสิทธิ์เจ้าของร้านของคุณ:\n{redirect_url}"
+                            )
+                            if replyToken:
+                                _reply_line(msg)
+                            else:
+                                api.push_message(user_id, msg)
+                        else:
+                            logger.warning(
+                                "consumer-owner-bind: invite jti=%s created but no LINE client available %s",
+                                jti, _log_ctx(shop_id, user_id, event_id, message_id)
+                            )
+                    except Exception as e:
+                        logger.warning(
+                            "consumer-owner-bind: issue invite failed shop=%s user=%s err=%s",
+                            shop_id, user_id, e
+                        )
+                    onboarding_handled = True
+
                 # GATE(admin-onboarding): admin-only
-                if (oa_ctx == "admin") and any(k in low_txt for k in start_keywords):
+                if not onboarding_handled and (oa_ctx == "admin") and any(k in low_txt for k in start_keywords):
                     clear_session(user_id)
                     sess = {
                         "step": 1,
@@ -1104,14 +1147,14 @@ def line_webhook():
                     if msg_obj:
                         _reply_line(msg_obj)
                     onboarding_handled = True
-                elif (oa_ctx == "admin") and (low_txt == "ยกเลิก" and step):
+                elif not onboarding_handled and (oa_ctx == "admin") and (low_txt == "ยกเลิก" and step):
                     clear_session(user_id)
                     logger.info("onboarding cancel %s", _log_ctx(shop_id, user_id, event_id, message_id))
                     msg_obj = _qr_text("🙅 ยกเลิกขั้นตอนแล้วครับ\nพิมพ์ “เริ่มต้นใช้งาน” เพื่อเริ่มใหม่ได้เลย")
                     if msg_obj:
                         _reply_line(msg_obj)
                     onboarding_handled = True
-                elif (oa_ctx == "admin") and (low_txt in ("ยืนยันข้อมูล", "ยืนยัน")):
+                elif not onboarding_handled and (oa_ctx == "admin") and (low_txt in ("ยืนยันข้อมูล", "ยืนยัน")):
                     if sess.get("name") and sess.get("phone") and sess.get("shop"):
                         req_id = finalize_request_from_session(user_id)
                         if req_id:
@@ -1136,7 +1179,7 @@ def line_webhook():
                         if msg_obj:
                             _reply_line(msg_obj)
                     onboarding_handled = True
-                elif (oa_ctx == "admin") and (step == 1 and text):
+                elif not onboarding_handled and (oa_ctx == "admin") and (step == 1 and text):
                     sess["name"] = text.strip()
                     sess["step"] = 2
                     save_session(user_id, sess)
@@ -1144,7 +1187,7 @@ def line_webhook():
                     if msg_obj:
                         _reply_line(msg_obj)
                     onboarding_handled = True
-                elif (oa_ctx == "admin") and (step == 2):
+                elif not onboarding_handled and (oa_ctx == "admin") and (step == 2):
                     phone = _normalize_phone_th(text)
                     if phone and len(phone) == 10 and phone.startswith("0"):
                         sess["phone"] = phone
@@ -1156,7 +1199,7 @@ def line_webhook():
                     if msg_obj:
                         _reply_line(msg_obj)
                     onboarding_handled = True
-                elif (oa_ctx == "admin") and (step == 3 and text):
+                elif not onboarding_handled and (oa_ctx == "admin") and (step == 3 and text):
                     sess["shop"] = text.strip()
                     sess["step"] = 4
                     save_session(user_id, sess)
@@ -1164,7 +1207,7 @@ def line_webhook():
                     if msg_obj:
                         _reply_line(msg_obj)
                     onboarding_handled = True
-                elif (oa_ctx == "admin") and (step == 4 and low_txt == "ร้านออนไลน์"):
+                elif not onboarding_handled and (oa_ctx == "admin") and (step == 4 and low_txt == "ร้านออนไลน์"):
                     sess["location"] = None
                     sess["step"] = 5
                     save_session(user_id, sess)
