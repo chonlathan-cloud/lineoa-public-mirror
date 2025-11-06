@@ -38,10 +38,11 @@ from core.payments import parse_payment_intent as core_parse_intent, create_or_a
 from werkzeug.utils import secure_filename
 try:
     from linebot import LineBotApi
-    from linebot.models import TextSendMessage
+    from linebot.models import TextSendMessage, ImageSendMessage
 except Exception:
     LineBotApi = None  # optional
     TextSendMessage = None
+    ImageSendMessage = None
 try:
     from dao import get_shop_settings, get_shop  # reuse DAO helpers when available
 except Exception:
@@ -60,7 +61,11 @@ _ADMIN_BASE_DEFAULT = "https://lineoa-admin-250878482242.asia-southeast1.run.app
 _CONSUMER_BASE_DEFAULT = "https://lineoa-consumer-250878482242.asia-southeast1.run.app"
 ADMIN_BASE_URL = (os.getenv("ADMIN_BASE_URL") or os.getenv("OWNER_PORTAL_BASE_URL") or _ADMIN_BASE_DEFAULT).rstrip("/")
 CONSUMER_BASE_URL = (os.getenv("CONSUMER_BASE_URL") or _CONSUMER_BASE_DEFAULT).rstrip("/")
+
 CONSUMER_WEBHOOK_URL = f"{CONSUMER_BASE_URL}/line/webhook"
+
+# --- Admin OA token for owner invite ---
+ADMIN_LINE_TOKEN = (os.getenv("ADMIN_LINE_CHANNEL_ACCESS_TOKEN") or "").strip()
 
 # --- Helper: fetch bot info v2 ---
 def _fetch_bot_info_v2(access_token: str) -> Dict[str, Any]:
@@ -260,23 +265,72 @@ def _line_bot_api_for_shop(shop_id: str, settings: Optional[Dict[str, Any]] | No
 def _build_owner_invite_url(shop_id: str, token: str) -> str:
     return f"{ADMIN_BASE_URL}/owner/auth/liff/boot?sid={shop_id}&token={token}"
 
-def _send_owner_invite_message(shop_id: str, settings: Optional[Dict[str, Any]], target_user_id: str, invite_url: str) -> tuple[bool, Optional[str]]:
+# --- Helper: build add-friend link for consumer OA using basic_id ---
+def _build_consumer_add_friend_link(settings: Optional[Dict[str, Any]]) -> Optional[str]:
+    """Return public add-friend URL for the consumer OA using basic_id, if available."""
+    try:
+        cfg = (settings or {}).get("oa_consumer") or (settings or {})
+        basic_id = (cfg.get("basic_id") or "").strip()
+        if basic_id.startswith("@"):
+            basic_id = basic_id[1:]
+        if basic_id:
+            return f"https://page.line.me/{basic_id}"
+    except Exception:
+        pass
+    return None
+
+def _send_owner_invite_message(shop_id, settings, target_user_id, invite_url):
     if not target_user_id:
         return False, "missing_target_user"
-    api = _line_bot_api_for_shop(shop_id, settings=settings if settings else None)
+
+    logger = logging.getLogger("admin-invite")
+
+    # Force use admin OA (MIA)
+    token = (ADMIN_LINE_TOKEN or os.getenv("ADMIN_LINE_CHANNEL_ACCESS_TOKEN", "").strip())
+    if not token:
+        logger.warning("owner invite push skipped: missing ADMIN_LINE_CHANNEL_ACCESS_TOKEN")
+        return False, "missing_admin_token"
+
+    api = LineBotApi(token) if LineBotApi else None
     if not api or not TextSendMessage:
         return False, "linebot_unavailable"
+
+    # Diagnostic: verify friendship/profile with this token first
     try:
-        text = (
-            "พร้อมแล้วครับ 🎉\n"
-            "ลิงก์เข้าสู่ระบบเจ้าของร้าน (กดเพื่อลงชื่อเข้าใช้):\n"
-            f"{invite_url}"
+        prof = api.get_profile(target_user_id)
+        logger.info(
+            "owner invite push using ADMIN token prefix=%s user=%s display=%s",
+            (token[:8] + "…"), target_user_id, getattr(prof, "display_name", None)
         )
-        api.push_message(target_user_id, TextSendMessage(text=text))
+    except Exception as e:
+        logger.warning("admin token cannot get profile user=%s err=%s", target_user_id, e)
+        # Continue anyway; some channels may restrict profile but still allow push
+
+    try:
+        add_friend_url = _build_consumer_add_friend_link(settings)
+        text_lines = [
+            "พร้อมแล้วครับ 🎉",
+            "ลิงก์เข้าสู่ระบบเจ้าของร้าน (สำหรับเข้าหน้า Owner Portal):",
+            f"{invite_url}",
+        ]
+        if add_friend_url:
+            text_lines += [
+                "\nลิงก์เพิ่มเพื่อน LINE OA ของร้าน (ส่งต่อลูกค้า/ทีมงานได้):",
+                add_friend_url,
+            ]
+        text = "\n".join(text_lines)
+        messages = [TextSendMessage(text=text)]
+        # Attach QR for consumer OA if we have its link and ImageSendMessage is available
+        if add_friend_url and ImageSendMessage:
+            from urllib.parse import quote as _q
+            qr_url = f"https://api.qrserver.com/v1/create-qr-code/?size=600x600&data={_q(add_friend_url, safe='')}"
+            messages.append(ImageSendMessage(original_content_url=qr_url, preview_image_url=qr_url))
+        api.push_message(target_user_id, messages)
         return True, None
     except Exception as e:
-        logging.getLogger("admin-invite").warning(
-            "push owner invite failed shop=%s user=%s err=%s", shop_id, target_user_id, e
+        logger.warning(
+            "push owner invite failed via ADMIN shop=%s user=%s err=%s",
+            shop_id, target_user_id, e,
         )
         return False, str(e)
 
