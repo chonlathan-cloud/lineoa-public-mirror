@@ -17,6 +17,7 @@ from urllib.error import HTTPError, URLError
 import re
 import io
 import base64, json, os, logging
+from urllib.parse import quote as _q
 # Try to import heavy report renderer (uses matplotlib); fall back to a tiny ReportLab-only stub if unavailable
 try:
     from report_renderer import _build_report_pdf_v3, _build_report_pdf_weasy  # preferred (may import matplotlib)
@@ -136,8 +137,7 @@ import os as _os_boot
 if not getattr(app, "secret_key", None):
     app.secret_key = _os_boot.environ.get("FLASK_SECRET_KEY", "dev-secret-key")
 
-from admin.blueprint import admin_bp, _sign_owner_invite, _build_owner_invite_url
-# from owner.blueprint import owner_bp  # (optional; keep commented if not used)
+from admin.blueprint import admin_bp, _sign_owner_invite, _build_owner_invite_url, _send_owner_invite_message# from owner.blueprint import owner_bp  # (optional; keep commented if not used)
 
 app.register_blueprint(admin_bp)
 # app.register_blueprint(owner_bp)  # (optional)
@@ -367,14 +367,51 @@ def _push_payment_review_to_owners(shop_id: str, access_token: Optional[str], us
             upsert_owner_profile(shop_id, line_display_name=display_name)
     except Exception as e:
         logger.warning("fetch bot info failed: %s %s", e, _log_ctx(shop_id=shop_id))
-
+# lineoa_frontend.py
 def _get_shop_and_settings_by_line_oa_id(line_oa_id: str) -> Optional[Dict[str, Any]]:
     destination = line_oa_id
-    # Use core mapping (supports bot_user_id and numeric channelId) + DEFAULT_SHOP_ID fallback
     ctx = core_load_ctx(destination)
     if not ctx:
         return None
-    return {"shop_id": ctx["shop_id"], "settings": ctx.get("settings") or {}}
+
+    # Start with whatever core gives us (may be root-level settings)
+    base_settings = ctx.get("settings") or {}
+
+    # Decide if we need to fetch the subcollection settings/default
+    need_fallback = False
+    try:
+        consumer_cfg = (base_settings or {}).get("oa_consumer")
+        consumer_bot = None
+        if isinstance(consumer_cfg, dict):
+            consumer_bot = (consumer_cfg.get("bot_user_id") or "").strip()
+        # Fallback if consumer block missing or bot_user_id is empty
+        need_fallback = not consumer_bot
+    except Exception:
+        need_fallback = True
+
+    merged = dict(base_settings) if isinstance(base_settings, dict) else {}
+
+    if need_fallback:
+        try:
+            sub_settings = _get_settings_by_shop_id(ctx["shop_id"]) or {}
+            # Merge: subcollection values override base when present
+            if isinstance(sub_settings, dict):
+                merged.update(sub_settings)
+        except Exception:
+            pass
+
+    try:
+        cb = None
+        oc = merged.get("oa_consumer") if isinstance(merged.get("oa_consumer"), dict) else {}
+        for k in ("bot_user_id", "botUserId"):
+            v = oc.get(k)
+            if isinstance(v, str) and v.strip():
+                cb = v.strip()
+                break
+        logger.info("settings-merged: shop=%s has_consumer=%s consumer.bot=%s keys=%s", ctx.get("shop_id"), isinstance(oc, dict), cb or "", list(oc.keys()) if isinstance(oc, dict) else [])
+    except Exception:
+        pass
+    return {"shop_id": ctx["shop_id"], "settings": merged}
 
 def _resolve_oa_context(line_oa_id: str, settings: Dict[str, Any]) -> str:
     """
@@ -383,9 +420,34 @@ def _resolve_oa_context(line_oa_id: str, settings: Dict[str, Any]) -> str:
     Fallback default is 'admin' to be safe for the A->B flow.
     """
     try:
-        consumer = (settings or {}).get("oa_consumer") or {}
-        consumer_bot = (consumer.get("bot_user_id") or "").strip()
-        # Some tenants store numeric channel_id; we primarily compare bot_user_id (destination).
+        # Accept various shapes/names to be resilient with existing data
+        s = (settings or {}) if isinstance(settings, dict) else {}
+        consumer = s.get("oa_consumer") if isinstance(s.get("oa_consumer"), dict) else {}
+        # Candidate fields for bot user id
+        candidates = [
+            (consumer.get("bot_user_id") if isinstance(consumer, dict) else None),
+            (consumer.get("botUserId") if isinstance(consumer, dict) else None),
+            s.get("oa_consumer_bot_user_id"),  # flattened style
+            s.get("bot_user_id"),               # occasionally stored at root
+        ]
+        consumer_bot = None
+        for v in candidates:
+            if isinstance(v, str) and v.strip():
+                consumer_bot = v.strip()
+                break
+        # Extra diagnostics so we can see why it still falls back to admin
+        try:
+            logger.info(
+                "ctx-judge: dest=%s consumer.bot=%s has_oa_consumer=%s oa_consumer_keys=%s root_keys=%s",
+                (line_oa_id or "").strip(),
+                consumer_bot or "",
+                isinstance(consumer, dict),
+                list((consumer or {}).keys()),
+                list(s.keys())
+            )
+        except Exception:
+            pass
+        # Primary comparison: destination (botUserId) vs consumer botUserId
         if consumer_bot and isinstance(line_oa_id, str) and line_oa_id.strip() == consumer_bot:
             return "consumer"
     except Exception:
@@ -907,6 +969,8 @@ def line_webhook_verify_slash():
 
 @app.post("/line/webhook")
 def line_webhook():
+    logger.info("WEBHOOK recv: headers=%s", dict(request.headers))
+    logger.info("WEBHOOK body: %s", request.get_data(as_text=True))
     signature = request.headers.get("X-Line-Signature", "")
     body_bytes: bytes = request.get_data()
     try:
@@ -1026,7 +1090,62 @@ def line_webhook():
             low_txt = (text or "").strip().lower()
             start_keywords = ("เริ่มต้นใช้งาน", "เริ่มต้นเปิดร้านของคุณ")
             is_admin_start = (oa_ctx == "admin") and any(k in low_txt for k in start_keywords)
+            logger.info("DEBUG owner-flow ctx=%s owner=%s step=%s is_admin_start=%s",
+                        oa_ctx, bool(owner), step, is_admin_start)
             owner_prompt_msg = None
+
+            # --- Auto-owner bootstrap via "เริ่มต้นใช้งาน" on consumer OA ---
+            try:
+                t_start = (text or "").strip()
+            except Exception:
+                t_start = ""
+            try:
+                is_admin_start = bool(is_admin_start)
+            except Exception:
+                is_admin_start = False
+
+            if (oa_ctx == "consumer") and (t_start in ("เริ่มต้นใช้งาน", "เริ่มต้น", "start", "Start")) and (not is_admin_start):
+                # 1) Upsert owners/{user_id} เป็น active owner
+                try:
+                    try:
+                        add_owner_user(shop_id, user_id, roles=["owner"])
+                    except TypeError:
+                        # รองรับซิกเนเจอร์รุ่นเก่าที่ไม่มี roles
+                        add_owner_user(shop_id, user_id)
+                except Exception as _own_err:
+                    logger.warning("auto-add owner failed: %s %s", _own_err, _log_ctx(shop_id=shop_id, user_id=user_id))
+
+                # 2) สร้างลิงก์ owner-invite (magic) แล้วห่อด้วย LIFF global
+                try:
+                    token, _jti, _exp = _sign_owner_invite(shop_id)
+                    boot_url = _build_owner_invite_url(shop_id, token)  # {ADMIN_BASE_URL}/owner/auth/liff/boot?sid=...&token=...
+
+                    global_liff_id = (os.getenv("GLOBAL_LIFF_ID") or "").strip()
+                    deep_link = (f"https://liff.line.me/{global_liff_id}?next={_q(boot_url, safe='')}"
+                                 if global_liff_id else boot_url)
+
+                    # ใช้ access token ของ OA ฝั่ง consumer (ต้องตรงกับ destination ตอนนี้) ในการส่งข้อความ
+                    token_for_push = _resolve_secret_value(settings, "line_channel_access_token", "sm_line_channel_access_token")
+                    if token_for_push and LineBotApi and TextSendMessage:
+                        api_tmp = LineBotApi(token_for_push)
+                        msg_intro = TextSendMessage(text="✅ เชื่อมสิทธิ์เจ้าของร้านเรียบร้อยแล้วครับ\nกดลิงก์ด้านล่างเพื่อเปิดหน้าจัดการร้านของคุณ")
+                        msg_link = TextSendMessage(text=deep_link)
+                        # ถ้ามี replyToken ใช้ reply ก่อน เพื่อประหยัด quota; ถ้า fail ค่อย push
+                        try:
+                            if replyToken:
+                                api_tmp.reply_message(replyToken, [msg_intro, msg_link])
+                            else:
+                                api_tmp.push_message(user_id, [msg_intro, msg_link])
+                        except Exception:
+                            api_tmp.push_message(user_id, [msg_intro, msg_link])
+                        logger.info("pushed LIFF owner-invite link to %s shop=%s", user_id, shop_id)
+                    else:
+                        logger.warning("skip LIFF push: missing consumer token or LINE SDK %s", _log_ctx(shop_id=shop_id, user_id=user_id))
+                except Exception as _push_err:
+                    logger.warning("push LIFF owner-invite failed: %s %s", _push_err, _log_ctx(shop_id=shop_id, user_id=user_id))
+
+                # จบเคสนี้เพื่อไม่ให้ไปชน handler อื่นซ้ำ
+                return "ok", 200
 
             # fire consumer owner-binding prompt เฉพาะเมื่อ webhook มาจาก consumer OA จริงๆ
             _oc = (settings or {}).get("oa_consumer") or {}
@@ -1042,6 +1161,52 @@ def line_webhook():
                 "owner_prompt gate: is_consumer_dest=%s oa_ctx=%s shop=%s dest=%s",
                 _is_consumer_dest, oa_ctx, shop_id, _dest
             )
+            # --- Owner invite flow when message comes via consumer OA ---
+            try:
+                _t = (text or "").strip()
+            except Exception:
+                _t = text if isinstance(text, str) else ""
+
+            start_words = {"เริ่มต้นใช้งาน", "เริ่มต้นใช้ งาน", "start", "Start", "เริ่มต้น ใช้งาน"}
+
+            if oa_ctx == "consumer" and _t in start_words:
+                try:
+                    # 1) สร้าง magic link สำหรับร้านนี้
+                    token, jti, exp = _sign_owner_invite(shop_id)
+                    invite_url = _build_owner_invite_url(shop_id, token)
+
+                    # 2) ส่งลิงก์/QR ผ่าน ADMIN OA (MIA)
+                    sent, err = _send_owner_invite_message(shop_id, settings, user_id, invite_url)
+                    logger.info("owner-invite via consumer trigger shop=%s user=%s sent=%s err=%s",
+                                shop_id, user_id, sent, err)
+
+                    # 3) แจ้งยืนยันในห้องแชต consumer เพื่อให้ผู้ใช้รู้ว่ามีลิงก์ถูกส่งไปที่ MIA แล้ว
+                    if LineBotApi and TextSendMessage and access_token:
+                        try:
+                            api = LineBotApi(access_token)  # token ของ OA ร้าน (consumer)
+                            ack = (
+                                "ลิงก์ยืนยันสิทธิ์เจ้าของร้าน:\n"
+                                f"{invite_url}\n\n"
+                                "ถ้ากดไม่ได้ ลองสแกน QR ด้านล่างได้ครับ"
+                            )
+                            api.push_message(user_id, TextSendMessage(text=ack))
+
+                            # แนบ QR ของลิงก์ (ถ้ามี ImageSendMessage)
+                            try:
+                                from linebot.models import ImageSendMessage
+                                qr = f"https://api.qrserver.com/v1/create-qr-code/?size=600x600&data={_q(invite_url, safe='')}"
+                                api.push_message(user_id, ImageSendMessage(original_content_url=qr, preview_image_url=qr))
+                            except Exception:
+                                pass
+
+                            logger.info("consumer fallback: pushed invite_url to user via consumer OA %s",
+                                                            _log_ctx(shop_id=shop_id, user_id=user_id))
+                        except Exception as _fb_err:
+                            logger.warning("consumer fallback push failed: %s %s",
+                                        _fb_err, _log_ctx(shop_id=shop_id, user_id=user_id))
+                except Exception as _oi_err:
+                    logger.warning("consumer owner-invite flow failed: %s %s",
+                                _oi_err, _log_ctx(shop_id=shop_id, user_id=user_id))
 
             if _is_consumer_dest and (oa_ctx == "consumer") and (not owner) and (not is_admin_start):
                 asked_flag = bool((sess or {}).get("_asked_owner_bind"))

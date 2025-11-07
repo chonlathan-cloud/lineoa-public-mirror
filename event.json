@@ -1,0 +1,11 @@
+{
+  "destination": "U96ebb73e4bb8967767239837c45bdea5",
+  "events": [{
+    "type": "message",
+    "message": {"type": "text","id":"1","text":"เริ่มต้นใช้งาน"},
+    "replyToken":"dummy",
+    "source":{"type":"user","userId":"Ub68fdd63bb52aea6eeb321b61324ca3a"},
+    "timestamp": 1700000000000,
+    "mode": "active"
+  }]
+}
