@@ -8,8 +8,8 @@
       <div style="flex:1 1 200px">
         <label>ประเภทรายงาน</label>
         <select name="kind" id="kind">
-          <option value="full">Full Report (มีกราฟเส้น)</option>
-          <option value="mini">Mini Report (4 การ์ดตัวเลข)</option>
+          <option value="mini">Full Report (มีกราฟเส้น)</option>
+          <option value="full">Mini Report (4 การ์ดตัวเลข)</option>
         </select>
       </div>
       <div style="flex:1 1 200px">
@@ -91,7 +91,8 @@ async function refreshList(){
   const js = await res.json();
   listEl.innerHTML = (js.items||[]).map(x => `
     <div style="border:1px solid #e5e7eb;border-radius:8px;padding:10px;margin-bottom:8px;background:#fff">
-      <div><b>ประเภท:</b> ${x.kind || "-"}</div>
+      <div><div><b>ประเภท:</b> ${x.kind === 'mini' ? 'Full Report (มีกราฟเส้น)' : 
+                                x.kind === 'full' ? 'Mini Report (4 การ์ดตัวเลข)' : (x.kind || '-')}
       <div><b>ช่วงเวลา:</b> ${x.start_date ? x.start_date.slice(0,10) : "-"} → ${x.end_date ? x.end_date.slice(0,10) : "-"}</div>
       <div><b>สถานะ:</b> ${x.status}</div>
       <div class="muted">สร้างเมื่อ: ${x.created_at || "-"}</div>

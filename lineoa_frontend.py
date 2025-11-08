@@ -20,7 +20,8 @@ import base64, json, os, logging
 from urllib.parse import quote as _q
 # Try to import heavy report renderer (uses matplotlib); fall back to a tiny ReportLab-only stub if unavailable
 try:
-    from report_renderer import _build_report_pdf_v3, _build_report_pdf_weasy  # preferred (may import matplotlib)
+    from report_renderer import build_report_pdf_v3, _build_report_pdf_weasy  # preferred (may import matplotlib)
+    _build_report_pdf_v3 = build_report_pdf_v3
 except Exception as _rr_err:
     import io as _io_fallback
     def _build_report_pdf_v3(shop_id, start_dt, end_dt, **kwargs):

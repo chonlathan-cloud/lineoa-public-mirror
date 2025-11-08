@@ -121,6 +121,43 @@ def _fallback_pdf_stub(shop_id: str, start_dt, end_dt) -> bytes:
     return buf.getvalue()
 
 
+# --- Report storage config (public PDF links) ---
+REPORT_BUCKET = (os.getenv("REPORT_BUCKET") or "lineoa-report-for-owner").strip()
+REPORT_PUBLIC_BASE = (os.getenv("REPORT_PUBLIC_BASE") or "https://storage.googleapis.com/lineoa-report-for-owner").rstrip("/")
+
+_storage_client_reports = None
+def _gcs_client_reports():
+    global _storage_client_reports
+    if _storage_client_reports is None:
+        try:
+            _storage_client_reports = storage.Client()
+        except Exception:
+            _storage_client_reports = None
+    return _storage_client_reports
+
+def _store_report_pdf(shop_id: str, req_id: str, pdf_bytes: bytes, variant: str) -> tuple[str, str]:
+    """Upload PDF → gs://<REPORT_BUCKET>/reports/<shop>/requests/<req>/<variant>.pdf"""
+    client = _gcs_client_reports()
+    if client is None:
+        raise RuntimeError("gcs_client_unavailable")
+    bucket = client.bucket(REPORT_BUCKET)
+    variant = (variant or "mini").strip().lower()
+    if variant not in ("mini", "full"):
+        variant = "mini"
+    object_path = f"reports/{shop_id}/requests/{req_id}/{variant}.pdf"
+    blob = bucket.blob(object_path)
+    try:
+        blob.cache_control = "public, max-age=3600"
+    except Exception:
+        pass
+    blob.upload_from_string(pdf_bytes or b"", content_type="application/pdf")
+    return REPORT_BUCKET, object_path
+
+def _report_public_url(bucket: str, object_path: str) -> str:
+    base = REPORT_PUBLIC_BASE or f"https://storage.googleapis.com/{bucket}"
+    return f"{base}/{object_path}"
+
+
 def _resolve_shop_display_name(shop_id: Optional[str]) -> Optional[str]:
     """Return the human-friendly shop name for UI surfaces."""
     if not shop_id:
@@ -1254,139 +1291,6 @@ def list_report_requests(shop_id):
     return jsonify({"ok": True, "items": items})
 
 
-# --- Helpers: parse incoming Start/End robustly (accept Thai BE year and strings) ---
-_DEF_TZ = timezone.utc
-
-def _to_dt_utc(v):
-    """Coerce Firestore Timestamp, datetime, or string to aware UTC datetime.
-    Accepts Thai Buddhist years (BE), e.g., '27 Oct BE 2568' or year>=2400.
-    """
-    try:
-        # Firestore Timestamp
-        if hasattr(v, "to_datetime"):
-            return v.to_datetime().astimezone(timezone.utc)
-        # Already datetime
-        if hasattr(v, "astimezone"):
-            return v.astimezone(timezone.utc)
-        s = (str(v) or "").strip()
-        if not s:
-            return None
-        # Normalize Thai BE -> AD
-        # If the string contains 'BE' or year looks like 24xx-26xx, subtract 543
-        try:
-            if "BE" in s or "บ.ศ." in s or "พ.ศ." in s:
-                s_norm = s.replace("BE", "").replace("พ.ศ.", "").replace("บ.ศ.", "").strip()
-                dt = _dtparser.parse(s_norm, dayfirst=False, yearfirst=False, fuzzy=True)
-                if dt.year >= 2400:
-                    dt = dt.replace(year=dt.year - 543)
-                return dt.astimezone(timezone.utc)
-        except Exception:
-            pass
-        # Generic parse; if the year is >=2400, shift -543
-        dt = _dtparser.parse(s, fuzzy=True)
-        if dt.year >= 2400:
-            dt = dt.replace(year=dt.year - 543)
-        return dt.astimezone(timezone.utc)
-    except Exception:
-        return None
-
-
-@admin_bp.post("/owner/<shop_id>/reports/requests/<req_id>/run")
-def run_report_request(shop_id: str, req_id: str):
-    """Generate the PDF for a queued report request and update Firestore with links.
-    Returns {ok, pdf_url, request_id} or 404/400 on errors.
-    """
-    _owner_session_or_403(shop_id)
-    db = get_db()
-
-    doc_ref = db.collection("shops").document(shop_id).collection("report_requests").document(req_id)
-    snap = doc_ref.get()
-    if not snap.exists:
-        abort(404, "request_not_found")
-    obj = snap.to_dict() or {}
-
-    # Resolve time range
-    start_dt = _to_dt_utc(obj.get("start_date")) or (datetime.now(timezone.utc) - timedelta(days=14))
-    end_dt   = _to_dt_utc(obj.get("end_date"))   or datetime.now(timezone.utc)
-
-    # Choose renderer with graceful fallback (never 500 because of missing WeasyPrint/Jinja2)
-    kind = (obj.get("kind") or "mini").lower()
-    pdf_bytes = None
-    if kind == "mini":
-        # mini
-        if render_mini_report_pdf:
-            try:
-                pdf_bytes = render_mini_report_pdf(shop_id, start_dt, end_dt)
-            except Exception as e:
-                logging.getLogger("admin-auth").error("mini report render failed, try v3: %s", e)
-                try:
-                    from report_renderer import build_report_pdf_v3 as _fallback_pdf
-                    pdf_bytes = _fallback_pdf(shop_id, start_dt, end_dt)
-                except Exception as e2:
-                    logging.getLogger("admin-auth").error("v3 fallback failed, using stub: %s", e2)
-                    pdf_bytes = _fallback_pdf_stub(shop_id, start_dt, end_dt)
-        else:
-            try:
-                from report_renderer import build_report_pdf_v3 as _fallback_pdf
-                pdf_bytes = _fallback_pdf(shop_id, start_dt, end_dt)
-            except Exception as e:
-                logging.getLogger("admin-auth").error("fallback import failed, using stub: %s", e)
-                pdf_bytes = _fallback_pdf_stub(shop_id, start_dt, end_dt)
-    else:
-        # full
-        if render_full_report_pdf:
-            try:
-                pdf_bytes = render_full_report_pdf(shop_id, start_dt, end_dt)
-            except Exception as e:
-                logging.getLogger("admin-auth").error("full report render failed, try v3: %s", e)
-                try:
-                    from report_renderer import build_mini_report_pdf as _fallback_pdf
-                    pdf_bytes = _fallback_pdf(shop_id, start_dt, end_dt)
-                except Exception as e2:
-                    logging.getLogger("admin-auth").error("mini fallback failed, using stub: %s", e2)
-                    pdf_bytes = _fallback_pdf_stub(shop_id, start_dt, end_dt)
-        else:
-            try:
-                from report_renderer import build_mini_report_pdf as _fallback_pdf
-                pdf_bytes = _fallback_pdf(shop_id, start_dt, end_dt)
-            except Exception as e:
-                logging.getLogger("admin-auth").error("fallback import failed, using stub: %s", e)
-                pdf_bytes = _fallback_pdf_stub(shop_id, start_dt, end_dt)
-
-    # Upload to GCS
-    bucket_name = os.getenv("REPORT_BUCKET") or os.getenv("MEDIA_BUCKET")
-    if not bucket_name:
-        return jsonify({"ok": False, "error": "report_bucket_not_set"}), 500
-    try:
-        storage_client = storage.Client()
-        blob_path = f"reports/{shop_id}/{req_id}.pdf"
-        blob = storage_client.bucket(bucket_name).blob(blob_path)
-        blob.upload_from_string(pdf_bytes, content_type="application/pdf")
-        try:
-            blob.cache_control = "public, max-age=86400"; blob.patch()
-        except Exception:
-            pass
-        public_base = os.getenv("MEDIA_PUBLIC_BASE", f"https://storage.googleapis.com/{bucket_name}")
-        pdf_url = f"{public_base}/{blob_path}"
-        gcs_uri = f"gs://{bucket_name}/{blob_path}"
-    except Exception as e:
-        logging.getLogger("admin-auth").error("report upload failed: %s", e)
-        return jsonify({"ok": False, "error": "upload_failed"}), 500
-
-    # Update request document
-    try:
-        doc_ref.set({
-            "status": "done",
-            "updated_at": datetime.now(timezone.utc),
-            "pdf_url": pdf_url,
-            "pdf_gcs_uri": gcs_uri,
-            "start_date": start_dt,
-            "end_date": end_dt,
-        }, merge=True)
-    except Exception:
-        pass
-
-    return jsonify({"ok": True, "request_id": req_id, "pdf_url": pdf_url})
 
 
 @admin_bp.get("/owner/reports/request")
@@ -1863,3 +1767,111 @@ def _verify_line_id_token(raw_id_token: str) -> Optional[dict]:
 @admin_bp.post("/owner/auth/liff")
 def owner_auth_liff_alias():
     return owner_auth_liff_callback()
+
+
+@admin_bp.post("/owner/<shop_id>/reports/requests/<req_id>/run")
+def run_report_request(shop_id: str, req_id: str):
+    """
+    Generate PDF for a queued request and upload to REPORT_BUCKET.
+    Layout: reports/<shop_id>/requests/<req_id>/<variant>.pdf
+    """
+    db = get_db()
+
+    # Load request
+    ref = db.collection("shops").document(shop_id).collection("report_requests").document(req_id)
+    snap = ref.get()
+    if not snap.exists:
+        return jsonify({"ok": False, "error": "request_not_found"}), 404
+    req = snap.to_dict() or {}
+
+    # Parse dates → timezone-aware UTC
+    def _to_dt_utc(v):
+        if hasattr(v, "to_datetime"):
+            dt = v.to_datetime()
+        elif isinstance(v, str):
+            from dateutil import parser as _p
+            try:
+                dt = _p.isoparse(v)
+            except Exception:
+                dt = _p.parse(v)
+        elif isinstance(v, datetime):
+            dt = v
+        else:
+            dt = None
+        if dt and not getattr(dt, "tzinfo", None):
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt
+
+    start_dt = _to_dt_utc(req.get("start_date")) or (datetime.now(timezone.utc) - timedelta(days=14))
+    end_dt   = _to_dt_utc(req.get("end_date"))   or datetime.now(timezone.utc)
+
+    # Choose variant strictly from request.kind
+    variant = str((req.get("kind") or "mini")).strip().lower()
+    if variant.startswith("full"):
+        variant = "full"
+    elif variant != "mini":
+        variant = "mini"
+
+    # Render (no HTML/CSS changes)
+    pdf_bytes = b""
+    used = variant
+    try:
+        if variant == "full" and callable(render_full_report_pdf):
+            pdf_bytes = render_full_report_pdf(shop_id, start_dt, end_dt)
+        elif callable(render_mini_report_pdf):
+            pdf_bytes = render_mini_report_pdf(shop_id, start_dt, end_dt)
+            used = "mini"
+        else:
+            pdf_bytes = _fallback_pdf_stub(shop_id, start_dt, end_dt)
+            used = "fallback"
+    except Exception:
+        try:
+            if callable(render_mini_report_pdf):
+                pdf_bytes = render_mini_report_pdf(shop_id, start_dt, end_dt)
+                used = "mini"
+            else:
+                pdf_bytes = _fallback_pdf_stub(shop_id, start_dt, end_dt)
+                used = "fallback"
+        except Exception:
+            pdf_bytes = _fallback_pdf_stub(shop_id, start_dt, end_dt)
+            used = "fallback"
+
+    logging.getLogger("report").info("report: render_used=%s requested=%s shop=%s req=%s", used, variant, shop_id, req_id)
+
+    # Upload
+    try:
+        bucket, object_path = _store_report_pdf(shop_id, req_id, pdf_bytes, variant=variant)
+        pdf_url = _report_public_url(bucket, object_path)
+        gcs_uri = f"gs://{bucket}/{object_path}"
+    except Exception as e:
+        logging.getLogger("report").error("upload_failed %s", e)
+        return jsonify({"ok": False, "error": "upload_failed"}), 500
+
+    # Update request + mirror index
+    now = datetime.now(timezone.utc)
+    ref.set({
+        "status": "ready",
+        "updated_at": now,
+        "pdf_url": pdf_url,
+        "pdf_gcs_uri": gcs_uri,
+        "start_date": start_dt,
+        "end_date": end_dt,
+        "variant_saved": variant,
+    }, merge=True)
+
+    try:
+        (db.collection("shops").document(shop_id)
+           .collection("reports").document("requests")
+           .collection("items").document(req_id)
+        ).set({
+            "status": "ready",
+            "gcs_bucket": bucket,
+            "gcs_path": object_path,
+            "public_url": pdf_url,
+            "updated_at": now,
+            "variant": variant,
+        }, merge=True)
+    except Exception:
+        pass
+
+    return jsonify({"ok": True, "request_id": req_id, "pdf_url": pdf_url, "variant": variant})
