@@ -70,7 +70,7 @@ from dao import (
     list_messages, list_products, list_promotions, list_customers,
     add_owner_user, is_owner_user, upsert_owner_profile, get_owner_profile,
     ensure_event_once,  # <-- idempotency
-    list_owner_users,
+    list_owner_users, get_default_owner_user_id,
     record_manual_payment, confirm_payment, list_payments, sum_payments_between,
     attach_payment_slip,
     set_payment_confirm_code, find_pending_payment_by_code, 
@@ -157,6 +157,7 @@ def _root():
     return jsonify({"ok": True, "service": "lineoa-frontend", "ts": datetime.now(timezone.utc).isoformat()}), 200
 
 API_BEARER_TOKEN = os.environ.get("API_BEARER_TOKEN", "")
+PUSH_ALL_OWNERS = (os.environ.get("PUSH_ALL_OWNERS", "false") or "false").strip().lower() in ("1", "true", "yes", "on")
 
 # Optional fallback for dev when mapping destination -> shop_id ยังไม่ครบ
 DEFAULT_SHOP_ID = os.environ.get("DEFAULT_SHOP_ID", "").strip()
@@ -257,6 +258,45 @@ def _is_valid_line_user_id(uid: str) -> bool:
     except Exception:
         return False
 
+def _resolve_owner_push_targets(shop_id: str) -> List[str]:
+    """Return LINE user IDs that should receive owner notifications."""
+    owners: List[str] = []
+    try:
+        owners = [u for u in list_owner_users(shop_id) if _is_valid_line_user_id(u)]
+    except Exception as err:
+        logger.warning("list_owner_users failed %s err=%s", _log_ctx(shop_id=shop_id), err)
+        owners = []
+    default_owner = None
+    try:
+        default_owner = get_default_owner_user_id(shop_id)
+    except Exception as err:
+        logger.warning("get_default_owner_user_id failed %s err=%s", _log_ctx(shop_id=shop_id), err)
+    logger.info("push target default_owner_user_id=%s shop=%s push_all=%s", default_owner, shop_id, PUSH_ALL_OWNERS)
+    if PUSH_ALL_OWNERS:
+        return owners
+    if default_owner and _is_valid_line_user_id(default_owner):
+        return [default_owner]
+    if owners:
+        return owners[:1]
+    if default_owner:
+        return [default_owner]
+    return []
+
+def _mark_primary_owner_if_missing(shop_id: str, owner_user_id: str) -> None:
+    """Mark the first active owner as primary when none exists."""
+    if not (shop_id and owner_user_id):
+        return
+    try:
+        db = get_db()
+        col = db.collection("shops").document(shop_id).collection("owners")
+        q = col.where("is_primary", "==", True).limit(1)
+        docs = list(q.stream())
+        if docs:
+            return
+        col.document(owner_user_id).set({"is_primary": True}, merge=True)
+    except Exception as err:
+        logger.warning("mark_primary_owner_if_missing failed %s err=%s", _log_ctx(shop_id=shop_id, user_id=owner_user_id), err)
+
 def _get_settings_by_shop_id(shop_id: str) -> Dict[str, Any]:
     db = get_db()
     snap = db.collection("shops").document(shop_id).collection("settings").document("default").get()
@@ -328,7 +368,7 @@ def _push_payment_review_to_owners(shop_id: str, access_token: Optional[str], us
         return
     try:
         api = LineBotApi(access_token)
-        owners = [u for u in list_owner_users(shop_id) if _is_valid_line_user_id(u)]
+        owners = _resolve_owner_push_targets(shop_id)
         logger.info("payment-review push: owners=%s", owners)
         if not owners:
             return
@@ -1108,11 +1148,14 @@ def line_webhook():
             if (oa_ctx == "consumer") and (t_start in ("เริ่มต้นใช้งาน", "เริ่มต้น", "start", "Start")) and (not is_admin_start):
                 # 1) Upsert owners/{user_id} เป็น active owner
                 try:
-                    try:
-                        add_owner_user(shop_id, user_id, roles=["owner"])
-                    except TypeError:
-                        # รองรับซิกเนเจอร์รุ่นเก่าที่ไม่มี roles
-                        add_owner_user(shop_id, user_id)
+                    add_owner_user(
+                        shop_id,
+                        user_id,
+                        roles=["owner"],
+                        source="start_keyword",
+                        local_owner_user_id=user_id,
+                    )
+                    _mark_primary_owner_if_missing(shop_id, user_id)
                 except Exception as _own_err:
                     logger.warning("auto-add owner failed: %s %s", _own_err, _log_ctx(shop_id=shop_id, user_id=user_id))
 
@@ -1586,7 +1629,7 @@ def line_webhook():
                                         f"มีการแจ้งโอนจากลูกค้า\nยอด: {amt_txt}{slip_txt}\n"
                                         f"ยืนยัน: 1010\nปัดตก: 0011"
                                     )
-                                    for oid in [u for u in list_owner_users(shop_id) if isinstance(u, str) and u.startswith("U")]:
+                                    for oid in _resolve_owner_push_targets(shop_id):
                                         try:
                                             qr = None
                                             if QuickReply and QuickReplyButton and MessageAction:
@@ -1831,7 +1874,7 @@ def front_create_manual_payment(shop_id):
                 f"มีการแจ้งโอนจากลูกค้า\nยอด: {amt_txt}{slip_txt}\n"
                 f"ยืนยัน: 1010\nปัดตก: 0011"
             )
-            for oid in [u for u in list_owner_users(shop_id) if isinstance(u, str) and u.startswith("U")]:
+            for oid in _resolve_owner_push_targets(shop_id):
                 try:
                     api.push_message(oid, TextSendMessage(text=msg_owner))
                 except Exception as _pe:
@@ -2021,10 +2064,8 @@ def task_generate_biwk_report():
     # Push LINE to owners (summary + link)
     push_ok = False
     try:
-        owners = [u for u in list_owner_users(shop_id) if _is_valid_line_user_id(u)]
+        owners = _resolve_owner_push_targets(shop_id)
         if owners and access_token and LineBotApi:
-            # keep only real LINE userIds (start with 'U')
-            owners = [u for u in owners if isinstance(u, str) and u.startswith("U")]
             api = LineBotApi(access_token)
             url_txt = upload.get("signed_url") or upload.get("public_url") #or upload.get("gcs_uri")
             msg = (f"{REPORT_TITLE_TH}\n"

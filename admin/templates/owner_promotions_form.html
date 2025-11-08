@@ -2,6 +2,11 @@
 {% block title %}จัดการโปรโมชัน/สินค้า — {{ shop_label }}{% endblock %}
 {% block header %}โปรโมชัน/สินค้า — {{ shop_label }}{% endblock %}
 {% block content %}
+<div id="shopSwitcherWrap" class="card section" style="display:none;margin-bottom:16px">
+  <label style="display:block;font-weight:600;margin-bottom:4px">เลือกร้าน</label>
+  <select id="shopSelect" style="min-width:240px"></select>
+  <p class="muted" id="shopSwitcherHint" style="margin-top:8px;display:none"></p>
+</div>
 <div class="card section">
   <form id="itemForm" enctype="multipart/form-data">
     <input type="hidden" name="_id" />
@@ -71,8 +76,25 @@ const promoFields = document.getElementById("promotionFields");
 const productFields = document.getElementById("productFields");
 const promoPicsInput = document.getElementById("promoPics");
 const prodPicsInput = document.getElementById("prodPics");
+const shopSelectEl = document.getElementById("shopSelect");
+const shopSwitcherWrap = document.getElementById("shopSwitcherWrap");
+const shopSwitcherHint = document.getElementById("shopSwitcherHint");
 
 let currentMode = catEl.value === "product" ? "product" : "promotion";
+
+function setFormDisabled(flag){
+  try{
+    const elements = Array.from(formEl.elements || []);
+    for(const el of elements){
+      el.disabled = !!flag;
+    }
+    [catEl, listTypeEl].forEach(el => {
+      if(el){ el.disabled = !!flag; }
+    });
+  }catch(err){
+    console.warn("setFormDisabled failed", err);
+  }
+}
 
 function setMode(mode, { syncSelects = true } = {}){
   currentMode = mode === "product" ? "product" : "promotion";
@@ -95,8 +117,134 @@ listTypeEl.addEventListener("change", () => {
   refreshList();
 });
 
+async function fetchOwnerShops(){
+  const res = await fetch("/owner/shops", { credentials: "include", headers: { "Accept": "application/json" } });
+  if(!res.ok){
+    const text = await res.text();
+    throw new Error(text || "load_shops_failed");
+  }
+  return res.json();
+}
+
+async function postSwitchShop(nextShopId){
+  const res = await fetch("/owner/switch-shop", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    credentials: "include",
+    body: JSON.stringify({ shop_id: nextShopId })
+  });
+  let js = {};
+  try{
+    js = await res.json();
+  }catch(err){
+    js = {};
+  }
+  if(!res.ok || !js.ok){
+    const e = new Error(js && js.error ? js.error : "switch_failed");
+    e.code = js && js.error ? js.error : "switch_failed";
+    throw e;
+  }
+  return js;
+}
+
+async function initShopSelector(){
+  if(!shopSelectEl || !shopSwitcherWrap){
+    return;
+  }
+  try{
+    const data = await fetchOwnerShops();
+    const items = Array.isArray(data.items) ? data.items : [];
+    if(items.length <= 1){
+      if(items.length === 1){
+        const only = items[0];
+        if(data.current_shop_id !== only.shop_id){
+          await postSwitchShop(only.shop_id);
+          location.reload();
+          return;
+        }
+        shopId = only.shop_id;
+      }
+      shopSwitcherWrap.style.display = "none";
+      return;
+    }
+    shopSwitcherWrap.style.display = "";
+    shopSelectEl.innerHTML = ['<option value="">— เลือกร้าน —</option>'].concat(
+      items.map(item => `<option value="${item.shop_id}">${item.display_name || item.shop_id}</option>`)
+    ).join("");
+    if(data.current_shop_id && items.some(item => item.shop_id === data.current_shop_id)){
+      shopSelectEl.value = data.current_shop_id;
+      shopId = data.current_shop_id;
+      if(shopSwitcherHint){ shopSwitcherHint.style.display = "none"; }
+    } else if(shopSwitcherHint){
+      shopSwitcherHint.textContent = "กรุณาเลือกร้านเพื่อใช้งาน";
+      shopSwitcherHint.style.display = "block";
+    }
+    shopSelectEl.addEventListener("change", async (e) => {
+      const nextShop = e.target.value;
+      if(!nextShop){ return; }
+      shopSelectEl.disabled = true;
+      try{
+        await postSwitchShop(nextShop);
+        location.reload();
+      }catch(err){
+        shopSelectEl.disabled = false;
+        alert(err.message || "เปลี่ยนร้านไม่สำเร็จ");
+      }
+    });
+  }catch(err){
+    console.error("initShopSelector failed", err);
+    if(shopSwitcherWrap){
+      shopSwitcherWrap.style.display = "";
+    }
+    if(shopSwitcherHint){
+      shopSwitcherHint.textContent = "โหลดรายชื่อร้านไม่สำเร็จ";
+      shopSwitcherHint.style.display = "block";
+    }
+  }
+}
+
+async function ensureShopId(){
+  if(shopId){
+    return shopId;
+  }
+  try{
+    const res = await fetch("/owner/context", { credentials: "include", headers: { "Accept": "application/json" } });
+    let js = {};
+    try{
+      js = await res.json();
+    }catch(parseErr){
+      js = {};
+    }
+    if(res.ok && js && js.shop_id){
+      shopId = js.shop_id;
+      return shopId;
+    }
+    if(res.status === 400 && js && js.error === "shop_not_selected"){
+      const err = new Error("shop_not_selected");
+      err.code = "shop_not_selected";
+      throw err;
+    }
+    throw new Error(js && js.error ? js.error : "owner_session_missing");
+  }catch(err){
+    if(err && err.code !== "shop_not_selected"){
+      listEl.innerHTML = "ไม่พบสิทธิ์เจ้าของร้าน กรุณาเริ่มจากลิงก์ LIFF";
+    }
+    throw err;
+  }
+}
+
 async function refreshList(){
-  if(!shopId){ listEl.innerHTML = "<<<<<>>>>>>"; return; }
+  try{
+    const sid = await ensureShopId();
+    shopId = sid;
+  }catch(err){
+    if(err && err.code === "shop_not_selected"){
+      listEl.innerHTML = "กรุณาเลือกร้าน";
+      return;
+    }
+    listEl.innerHTML = "โหลดรายการล้มเหลว";
+    throw err;
+  }
   const kind = currentMode;
   const url = kind === "promotion" ? `/owner/${shopId}/promotions` : `/owner/${shopId}/products`;
   listEl.innerHTML = "Loading...";
@@ -153,19 +301,31 @@ async function refreshList(){
 
 formEl.addEventListener("submit", async (e) => {
   e.preventDefault();
-  if(!shopId){ alert("ยังไม่ทราบ shop_id — กรุณาเข้าผ่านลิงก์ที่มีพาธ /owner/&lt;shop_id&gt;/... หรือ ?sid="); return; }
+  let sid;
+  try{
+    sid = await ensureShopId();
+    shopId = sid;
+  }catch(err){
+    if(err && err.code === "shop_not_selected"){
+      alert("กรุณาเลือกร้านก่อนทำรายการ");
+      return;
+    }
+    console.error(err);
+    alert("ไม่พบสิทธิ์เจ้าของร้าน กรุณาเปิดผ่าน LIFF อีกครั้ง");
+    return;
+  }
   const fd = new FormData(formEl);
   const category = fd.get("category");
 
   let url = "";
   if(category === "promotion"){
-    url = `/owner/${shopId}/promotions`;
+    url = `/owner/${sid}/promotions`;
     fd.delete("pictures_prod");
     fd.delete("pictures[]");
     const pics = promoPicsInput && promoPicsInput.files ? promoPicsInput.files : [];
     for(const f of pics){ fd.append("pictures[]", f); }
   } else {
-    url = `/owner/${shopId}/products`;
+    url = `/owner/${sid}/products`;
     fd.delete("pictures");
     fd.delete("pictures_prod");
     fd.delete("pictures[]");
@@ -198,6 +358,20 @@ formEl.addEventListener("submit", async (e) => {
 });
 
 setMode(currentMode);
-refreshList();
+setFormDisabled(true);
+initShopSelector();
+(async function init(){
+  try{
+    await ensureShopId();
+    setFormDisabled(false);
+    await refreshList();
+  }catch(err){
+    if(err && err.code === "shop_not_selected"){
+      return;
+    }
+    console.error("initialization failed", err);
+    alert("ไม่พบสิทธิ์เจ้าของร้าน กรุณาเปิดผ่าน LIFF อีกครั้ง");
+  }
+})();
 </script>
 {% endblock %}

@@ -44,10 +44,11 @@ except Exception:
     TextSendMessage = None
     ImageSendMessage = None
 try:
-    from dao import get_shop_settings, get_shop  # reuse DAO helpers when available
+    from dao import get_shop_settings, get_shop, upsert_owner_shop_link  # reuse DAO helpers when available
 except Exception:
     get_shop_settings = None
     get_shop = None
+    upsert_owner_shop_link = None
 # Resolve renderers: **lock to approved file** to guarantee data logic matches the meeting-approved version.
 try:
     from report_renderer import build_mini_report_pdf as render_mini_report_pdf
@@ -233,6 +234,7 @@ MAGIC_LINK_SECRET_ENV = "MAGIC_LINK_SECRET"
 MAGIC_LINK_TTL_MIN_ENV = "MAGIC_LINK_TTL_MIN"
 OWNER_SESSION_COOKIE = "owner_session_sid"
 OWNER_SESSION_DAYS = 7  # cookie lifetime days
+OWNER_GLOBAL_COOKIE = "owner_session_uid"
 
 def _get_magic_secret() -> str:
     secret = os.getenv(MAGIC_LINK_SECRET_ENV)
@@ -455,12 +457,147 @@ def _set_owner_session_cookie(resp, shop_id: str) -> None:
         path="/owner"
     )
 
+def _clear_owner_session_cookie(resp) -> None:
+    try:
+        resp.delete_cookie(OWNER_SESSION_COOKIE, path="/owner")
+    except Exception:
+        pass
+
+def _set_owner_global_cookie(resp, owner_user_id: str, shop_id: str = None, global_user_id: str = None, invite_ctx: dict = None) -> None:
+    # Ensure global↔local mapping exists (prevents owner_not_mapped)
+    try:
+        _ensure_owner_mapping_after_liff(
+            shop_id,
+            global_user_id,
+            invite_ctx=invite_ctx if 'invite_ctx' in locals() else None
+        )
+    except Exception as _e:
+        logging.getLogger("admin-auth").warning("post-liff mapping failed: %s", _e)
+    if not owner_user_id:
+        return
+    max_age = OWNER_SESSION_DAYS * 24 * 60 * 60
+    secure_flag = True
+    try:
+        host = (request.host or "").split(":")[0]
+        if host in ("127.0.0.1", "localhost"):
+            secure_flag = False
+    except Exception:
+        pass
+    resp.set_cookie(
+        OWNER_GLOBAL_COOKIE,
+        owner_user_id,
+        max_age=max_age,
+        httponly=True,
+        secure=secure_flag,
+        samesite="Lax",
+        path="/owner"
+    )
+def _ensure_owner_mapping_after_liff(shop_id: str, global_user_id: str, invite_ctx: dict | None = None) -> None:
+    """
+    สร้าง mapping owner_shops/{global_user_id}/shops/{shop_id}
+    เพื่อป้องกัน error owner_not_mapped หลัง LIFF login
+    """
+    if not (shop_id and global_user_id):
+        return
+    try:
+        # 1) ลองใช้ used_by จาก magic_links (ถ้าเข้าผ่าน owner invite)
+        used_by = None
+        try:
+            if invite_ctx and invite_ctx.get("link_ref"):
+                snap = invite_ctx["link_ref"].get()
+                if getattr(snap, "exists", False):
+                    doc = (snap.to_dict() or {})
+                    used_by = doc.get("used_by") or doc.get("liff_user_id")
+        except Exception:
+            used_by = None
+
+        # 2) Fallback เป็น default owner ของร้าน
+        if not used_by:
+            try:
+                from dao import get_default_owner_user_id
+                used_by = get_default_owner_user_id(shop_id)
+            except Exception:
+                used_by = None
+
+        # 3) Upsert mapping (idempotent)
+        from dao import upsert_owner_shop_link
+        display_name = _resolve_shop_display_name(shop_id) or shop_id
+        upsert_owner_shop_link(
+            global_user_id,
+            shop_id,
+            display_name=display_name,
+            local_owner_user_id=used_by,
+            active=True,
+            extra={"source": "liff_boot"}
+        )
+    except Exception as e:
+        logging.getLogger("admin-auth").warning("ensure_owner_mapping_after_liff failed: %s", e)
+
 def _get_owner_session_shop_id() -> Optional[str]:
     """Return shop_id from owner session cookie if present."""
     try:
         return (request.cookies.get(OWNER_SESSION_COOKIE) or "").strip() or None
     except Exception:
         return None
+
+def _get_owner_global_user_id() -> Optional[str]:
+    try:
+        return (request.cookies.get(OWNER_GLOBAL_COOKIE) or "").strip() or None
+    except Exception:
+        return None
+
+def _ts_to_dt(value):
+    if hasattr(value, "to_datetime"):
+        try:
+            dt = value.to_datetime()
+            if dt and not getattr(dt, "tzinfo", None):
+                dt = dt.replace(tzinfo=timezone.utc)
+            return dt
+        except Exception:
+            return None
+    if isinstance(value, datetime):
+        if not getattr(value, "tzinfo", None):
+            return value.replace(tzinfo=timezone.utc)
+        return value
+    return None
+
+def _list_active_owner_shops(owner_user_id: Optional[str]) -> List[Dict[str, Any]]:
+    """Return active shops for a global owner (sorted newest first)."""
+    if not owner_user_id:
+        return []
+    log = logging.getLogger("owner-session")
+    try:
+        db = get_db()
+        col = (
+            db.collection("owner_shops")
+              .document(owner_user_id)
+              .collection("shops")
+        )
+        docs = list(col.stream())
+    except Exception as e:
+        log.warning("list_owner_shops failed owner=%s err=%s", owner_user_id, e)
+        return []
+
+    items: List[Dict[str, Any]] = []
+    for doc in docs:
+        data = doc.to_dict() or {}
+        if not bool(data.get("active", True)):
+            continue
+        display_name = data.get("display_name")
+        if not display_name:
+            try:
+                display_name = _resolve_shop_display_name(doc.id)
+            except Exception:
+                display_name = None
+        items.append({
+            "shop_id": doc.id,
+            "display_name": display_name or doc.id,
+            "local_owner_user_id": data.get("local_owner_user_id"),
+            "created_at": _ts_to_dt(data.get("created_at")) or datetime.min.replace(tzinfo=timezone.utc),
+        })
+
+    items.sort(key=lambda x: x.get("created_at") or datetime.min.replace(tzinfo=timezone.utc), reverse=True)
+    return items
 
 # --- Helper: resolve shop by owner LINE userId using collection group query
 def _find_shop_by_owner_user_id(owner_user_id: str) -> Optional[str]:
@@ -516,6 +653,24 @@ def _find_shop_by_owner_user_id(owner_user_id: str) -> Optional[str]:
 
     return None
 
+def _owner_has_shop_access(owner_user_id: str, shop_id: Optional[str]) -> bool:
+    if not (owner_user_id and shop_id):
+        return False
+    try:
+        db = get_db()
+        snap = (
+            db.collection("shops")
+              .document(shop_id)
+              .collection("owners")
+              .document(owner_user_id)
+              .get()
+        )
+        if not snap.exists:
+            return False
+        data = snap.to_dict() or {}
+        return bool(data.get("active", True))
+    except Exception:
+        return False
 
 def _ensure_owner_record(shop_id: str, owner_sub: str, claims: Optional[dict] = None) -> None:
     """Ensure shops/{shop}/owners/{owner_sub} exists and mark active."""
@@ -545,21 +700,37 @@ def _ensure_owner_record(shop_id: str, owner_sub: str, claims: Optional[dict] = 
         doc_ref.set(payload, merge=True)
 
         # Mirror mapping for owner_shops index
+        display_name = None
         try:
-            idx_ref = (
-                db.collection("owner_shops")
-                  .document(owner_sub)
-                  .collection("shops")
-                  .document(shop_id)
-            )
-            idx_payload: Dict[str, Any] = {
-                "active": True,
+            display_name = _resolve_shop_display_name(shop_id)
+        except Exception:
+            display_name = None
+        try:
+            extra_payload = {
                 "linked_at": now,
                 "last_login_at": now,
             }
             if global_channel_id:
-                idx_payload["last_login_channel_id"] = global_channel_id
-            idx_ref.set(idx_payload, merge=True)
+                extra_payload["last_login_channel_id"] = global_channel_id
+            if callable(upsert_owner_shop_link):
+                upsert_owner_shop_link(
+                    owner_sub,
+                    shop_id,
+                    display_name=display_name,
+                    active=True,
+                    extra=extra_payload,
+                )
+            else:
+                idx_ref = (
+                    db.collection("owner_shops")
+                      .document(owner_sub)
+                      .collection("shops")
+                      .document(shop_id)
+                )
+                if display_name:
+                    extra_payload["display_name"] = display_name
+                extra_payload["active"] = True
+                idx_ref.set(extra_payload, merge=True)
         except Exception as idx_err:
             log.debug("ensure_owner_record index update failed shop=%s owner=%s err=%s", shop_id, owner_sub, idx_err)
     except Exception as e:
@@ -1178,6 +1349,11 @@ def owner_promo_form(shop_id):
         </body></html>
         ''', shop_label=display_name or shop_id, shop_id=shop_id)
 
+def _abort_shop_selection_required():
+    resp = jsonify({"ok": False, "error": "shop_not_selected", "message": "กรุณาเลือกร้าน"})
+    resp.status_code = 400
+    abort(resp)
+
 @admin_bp.get('/owner/<shop_id>/reports/request')
 def owner_report_form(shop_id):
     display_name = _resolve_shop_display_name(shop_id)
@@ -1230,8 +1406,11 @@ def owner_report_form(shop_id):
         ''', shop_label=display_name or shop_id, shop_id=shop_id)
 def _owner_session_or_403(shop_id: str):
     sess = _get_owner_session_shop_id()
-    if not sess or sess != shop_id:
-        abort(403, "owner_session_missing_or_mismatch")
+    if sess and sess == shop_id:
+        return
+    if not sess and _get_owner_global_user_id():
+        _abort_shop_selection_required()
+    abort(403, "owner_session_missing_or_mismatch")
 
 @admin_bp.post("/owner/<shop_id>/reports/requests")
 def create_report_request(shop_id):
@@ -1296,7 +1475,8 @@ def list_report_requests(shop_id):
 @admin_bp.get("/owner/reports/request")
 def owner_report_form_session():
     shop_id = _get_owner_session_shop_id()
-    if not shop_id:
+    global_owner = _get_owner_global_user_id()
+    if not (shop_id or global_owner):
         target = quote("/owner/reports/request", safe="/")
         return redirect(f"/owner/auth/liff/boot?next={target}")
     return owner_report_form(shop_id)
@@ -1309,9 +1489,45 @@ def owner_context():
     Returns {ok, shop_id} or 401 if no session is present.
     """
     sid = _get_owner_session_shop_id()
-    if not sid:
+    if sid:
+        return jsonify({"ok": True, "shop_id": sid})
+    if _get_owner_global_user_id():
+        return jsonify({"ok": False, "error": "shop_not_selected", "message": "กรุณาเลือกร้าน"}), 400
+    return jsonify({"ok": False, "error": "owner_session_missing"}), 401
+
+@admin_bp.get("/owner/shops")
+def owner_list_shops():
+    owner_user_id = _get_owner_global_user_id()
+    if not owner_user_id:
         return jsonify({"ok": False, "error": "owner_session_missing"}), 401
-    return jsonify({"ok": True, "shop_id": sid})
+    items = _list_active_owner_shops(owner_user_id)
+    log = logging.getLogger("owner-session")
+    log.info("owner_shops_list owner=%s count=%s", owner_user_id, len(items))
+    current = _get_owner_session_shop_id()
+    payload = [{
+        "shop_id": item["shop_id"],
+        "display_name": item["display_name"],
+    } for item in items]
+    return jsonify({"ok": True, "items": payload, "current_shop_id": current})
+
+@admin_bp.post("/owner/switch-shop")
+def owner_switch_shop():
+    owner_user_id = _get_owner_global_user_id()
+    if not owner_user_id:
+        return jsonify({"ok": False, "error": "owner_session_missing"}), 401
+    data = request.get_json(silent=True) or request.form.to_dict() or {}
+    shop_id = (data.get("shop_id") or "").strip()
+    if not shop_id:
+        return jsonify({"ok": False, "error": "missing_shop_id"}), 400
+    items = _list_active_owner_shops(owner_user_id)
+    match = next((item for item in items if item["shop_id"] == shop_id), None)
+    if not match:
+        return jsonify({"ok": False, "error": "shop_not_found"}), 404
+    resp = jsonify({"ok": True, "shop_id": shop_id})
+    _set_owner_session_cookie(resp, shop_id)
+    _set_owner_global_cookie(resp, owner_user_id)
+    logging.getLogger("owner-session").info("switch_shop ok owner=%s shop=%s", owner_user_id, shop_id)
+    return resp
 
 # ---- API: Promotions ----
 @admin_bp.get("/owner/<shop_id>/promotions")
@@ -1535,16 +1751,13 @@ def owner_promo_form_shortcut():
             return render_template_string("<p>invalid token</p>"), 400
 
     # 2) Existing cookie or fallback sid
-    sess_sid = request.cookies.get(OWNER_SESSION_COOKIE)
+    sess_sid = _get_owner_session_shop_id()
     final_sid = (sid or sess_sid) or None
-    try:
-        return render_template(
-            'owner_promotions_form.html',
-            shop_id=final_sid,
-            shop_display_name=_resolve_shop_display_name(final_sid) if final_sid else None,
-        )
-    except TemplateNotFound:
-        return render_template_string("&lt;p&gt;กรุณาใส่ ?sid=&lt;shop_id&gt;&lt;/p&gt;")
+    global_owner = _get_owner_global_user_id()
+    if not (final_sid or global_owner):
+        target = quote("/owner/promotions/form", safe="/")
+        return redirect(f"/owner/auth/liff/boot?next={target}")
+    return owner_promo_form(final_sid)
 
 # --- Owner LIFF ID token callback ---
 @admin_bp.post("/owner/auth/liff/callback")
@@ -1608,6 +1821,11 @@ def owner_auth_liff_callback():
 
     # 4) Resolve shop_id for this owner (cookie → mapping → sid)
     invite_ctx = None
+    owner_shops = _list_active_owner_shops(owner_user_id)
+    available_ids = {item["shop_id"] for item in owner_shops}
+    cookie_shop = _get_owner_session_shop_id()
+    shop_id: Optional[str] = None
+
     if invite_token:
         invite_ctx, invite_err = _verify_owner_invite_token(invite_token)
         if not invite_ctx:
@@ -1616,24 +1834,39 @@ def owner_auth_liff_callback():
         if sid_param and sid_param != shop_id:
             return jsonify({"ok": False, "error": "sid_mismatch"}), 403
         sid_param = shop_id
+        available_ids.add(shop_id)
     else:
-        shop_id = _get_owner_session_shop_id()
-    if not shop_id:
-        shop_id = _find_shop_by_owner_user_id(owner_user_id)
-    if not shop_id and sid_param:
-        shop_id = sid_param
-    if not shop_id:
+        if sid_param and (sid_param in available_ids or _owner_has_shop_access(owner_user_id, sid_param)):
+            shop_id = sid_param
+        elif cookie_shop and cookie_shop in available_ids:
+            shop_id = cookie_shop
+        elif len(available_ids) == 1:
+            shop_id = next(iter(available_ids))
+
+    if not available_ids:
+        fallback_shop = _find_shop_by_owner_user_id(owner_user_id)
+        if fallback_shop:
+            available_ids.add(fallback_shop)
+            if not shop_id:
+                shop_id = fallback_shop
+
+    if not available_ids and not shop_id:
         logging.getLogger("admin-auth").error("owner user has no shop mapping sub=%s", owner_user_id)
         return jsonify({"ok": False, "error": "owner_not_mapped"}), 403
 
+    needs_selection = False
+    if not shop_id and available_ids:
+        needs_selection = True
+
     # 4.1) Ensure Firestore mapping exists/updates for this owner
-    try:
-        _ensure_owner_record(shop_id, owner_user_id, claims)
-    except Exception:
-        pass
+    if shop_id:
+        try:
+            _ensure_owner_record(shop_id, owner_user_id, claims)
+        except Exception:
+            pass
 
     # 4.2) If invite token used, mark as consumed and sync owner profile
-    if invite_ctx:
+    if invite_ctx and shop_id:
         try:
             now = datetime.now(timezone.utc)
             invite_ctx["link_ref"].set({
@@ -1663,9 +1896,14 @@ def owner_auth_liff_callback():
     resp = jsonify({
         "ok": True,
         "shop_id": shop_id,
-        "redirect": (next_param or f"/owner/{shop_id}/promotions/form")
+        "needs_shop_selection": needs_selection,
+        "redirect": (next_param or "/owner/promotions/form"),
     })
-    _set_owner_session_cookie(resp, shop_id)
+    _set_owner_global_cookie(resp, owner_user_id)
+    if shop_id:
+        _set_owner_session_cookie(resp, shop_id)
+    else:
+        _clear_owner_session_cookie(resp)
     return resp
 
     # Verify with LINE JWKS (RS256)

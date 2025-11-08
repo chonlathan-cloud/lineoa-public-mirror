@@ -58,9 +58,85 @@
         const idToken = liff.getIDToken();
         if(!idToken){ throw new Error("no id_token from LIFF"); }
         const params = new URLSearchParams(location.search);
-        const nextParam = params.get("next");
-        const sidParam = params.get("sid");
-        const inviteToken = params.get("token");
+        const seenSources = new Set();
+        const queue = [];
+        const enqueue = (val) => {
+          if(typeof val === "string" && val && !seenSources.has(val)){
+            seenSources.add(val);
+            queue.push(val);
+          }
+        };
+        const toSearchParams = (raw) => {
+          if(!raw){ return null; }
+          let text = raw;
+          try{
+            text = decodeURIComponent(text);
+          }catch(_err){}
+          if(text.startsWith("?")){
+            text = text.slice(1);
+          }
+          if(text.startsWith("http://") || text.startsWith("https://") || text.startsWith("/")){
+            try{
+              const urlObj = new URL(text, location.origin);
+              const qs = urlObj.search || "";
+              if(!qs){ return null; }
+              return new URLSearchParams(qs.slice(1));
+            }catch(_err){}
+          }
+          if(!text.includes("=")){
+            return null;
+          }
+          try{
+            return new URLSearchParams(text);
+          }catch(_err){
+            return null;
+          }
+        };
+
+        const coalesceFirst = (values) => {
+          if(!values){ return undefined; }
+          for(const v of values){
+            if(typeof v === "string" && v){
+              return v;
+            }
+          }
+          return undefined;
+        };
+
+        const nextValues = params.getAll("next");
+        const sidValues = params.getAll("sid");
+        const tokenValues = params.getAll("token");
+        const liffStateValues = params.getAll("liff.state");
+
+        let nextParam = coalesceFirst(nextValues);
+        let sidParam = coalesceFirst(sidValues);
+        let inviteToken = coalesceFirst(tokenValues);
+        for(const val of nextValues){ enqueue(val); }
+        for(const val of liffStateValues){ enqueue(val); }
+
+        while(queue.length){
+          const raw = queue.shift();
+          const parsed = toSearchParams(raw);
+          if(!parsed){ continue; }
+          const nestedNext = parsed.get("next");
+          if(nestedNext){
+            if(!nextParam){ nextParam = nestedNext; }
+            enqueue(nestedNext);
+          }
+          const nestedState = parsed.get("liff.state");
+          if(nestedState){
+            enqueue(nestedState);
+          }
+          if(!sidParam){
+            const val = parsed.get("sid");
+            if(val){ sidParam = val; }
+          }
+          if(!inviteToken){
+            const val = parsed.get("token");
+            if(val){ inviteToken = val; }
+          }
+        }
+
         const query = new URLSearchParams();
         if(nextParam){ query.set("next", nextParam); }
         if(sidParam){ query.set("sid", sidParam); }

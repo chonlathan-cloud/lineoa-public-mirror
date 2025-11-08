@@ -624,7 +624,7 @@ def build_mini_report_pdf(shop_id: str, start_dt: datetime, end_dt: datetime) ->
     k_total = summary.get("total_customers", 0)
     prev_new = prev_summary.get("new_customers") if prev_summary else 0
     prev_total_customers = prev_summary.get("total_customers") if prev_summary else 0
-    revenue_value = 300
+    revenue_value = summary.get("revenue", 0.0)
     prev_revenue = prev_summary.get("revenue") if prev_summary else 0
 
     chart_data_uri = ""

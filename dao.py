@@ -485,10 +485,25 @@ def list_customers(shop_id: str, limit: int = 100, before: Optional[str] = None)
 
 # ---------- owners / owner_profile ----------
 
-def add_owner_user(shop_id: str, owner_user_id: str) -> None:
+def add_owner_user(shop_id: str, owner_user_id: str, **extra: Any) -> None:
+    """Mark a LINE user as an active owner within shops/{shop}/owners."""
+    if not (shop_id and owner_user_id):
+        return
     db = get_db()
     ref = db.collection("shops").document(shop_id).collection("owners").document(owner_user_id)
-    ref.set({"active": True}, merge=True)
+
+    allowed_keys = {"roles", "source", "is_primary", "display_name", "line_display_name", "local_owner_user_id"}
+    payload: Dict[str, Any] = {"active": True, "updated_at": datetime.now(timezone.utc)}
+    for key in allowed_keys:
+        if key in extra and extra[key] is not None:
+            payload[key] = extra[key]
+    try:
+        snap = ref.get()
+    except Exception:
+        snap = None
+    if not snap or not snap.exists:
+        payload["created_at"] = datetime.now(timezone.utc)
+    ref.set(payload, merge=True)
 
 
 def is_owner_user(shop_id: str, user_id: str) -> bool:
@@ -507,6 +522,71 @@ def list_owner_users(shop_id: str) -> List[str]:
         if data.get("active", False):
             owners.append(doc.id)
     return owners
+
+def get_default_owner_user_id(shop_id: str) -> Optional[str]:
+    """Pick the owner who should receive push notifications for a shop."""
+    if not shop_id:
+        return None
+    db = get_db()
+    col = db.collection("shops").document(shop_id).collection("owners")
+    primary: Optional[str] = None
+    start_keyword_owner: Optional[str] = None
+    fallback: Optional[str] = None
+    try:
+        for doc in col.stream():
+            data = doc.to_dict() or {}
+            if not bool(data.get("active", True)):
+                continue
+            owner_id = doc.id
+            if data.get("is_primary"):
+                primary = owner_id
+                break
+            if not start_keyword_owner and (data.get("source") == "start_keyword"):
+                start_keyword_owner = owner_id
+            if not fallback:
+                fallback = owner_id
+    except Exception:
+        return primary or start_keyword_owner or fallback
+    return primary or start_keyword_owner or fallback
+
+def upsert_owner_shop_link(
+    global_user_id: str,
+    shop_id: str,
+    *,
+    display_name: Optional[str] = None,
+    local_owner_user_id: Optional[str] = None,
+    active: bool = True,
+    extra: Optional[Dict[str, Any]] = None,
+) -> None:
+    """Mirror mapping owner_shops/{global}/shops/{shop} to support multi-shop owners."""
+    if not (global_user_id and shop_id):
+        return
+    db = get_db()
+    ref = (
+        db.collection("owner_shops")
+          .document(global_user_id)
+          .collection("shops")
+          .document(shop_id)
+    )
+    now = datetime.now(timezone.utc)
+    payload: Dict[str, Any] = {
+        "active": bool(active),
+        "updated_at": now,
+    }
+    if display_name is not None:
+        payload["display_name"] = display_name
+    if local_owner_user_id is not None:
+        payload["local_owner_user_id"] = local_owner_user_id
+    for key, value in (extra or {}).items():
+        if value is not None:
+            payload[key] = value
+    try:
+        snap = ref.get()
+    except Exception:
+        snap = None
+    if not snap or not snap.exists:
+        payload["created_at"] = now
+    ref.set(payload, merge=True)
 
 
 
