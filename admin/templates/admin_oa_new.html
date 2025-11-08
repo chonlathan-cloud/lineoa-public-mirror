@@ -301,8 +301,79 @@
         <div class="section-title" style="margin-top:18px;">Saved Settings Payload</div>
         <pre class="summary">{{ result.settings | tojson(indent=2) }}</pre>
         <p class="muted">จัดการเจ้าของเพิ่มเติมได้ที่ <a href="/admin/oa/owners?shop_id={{ result.shop_id }}">/admin/oa/owners?shop_id={{ result.shop_id }}</a></p>
+        <div style="margin-top:18px;">
+          <button type="button" class="btn" onclick="saveAdminOaNewResult()">ดาวน์โหลดข้อมูลร้าน (JSON)</button>
+          <p class="muted">กดเพื่อเซฟข้อมูลร้านและค่า settings ลงไฟล์ .json เก็บเป็นหลักฐาน</p>
+        </div>
       </div>
     {% endif %}
   </div>
+  {% if result %}
+  <script>
+    window.__adminOaNewResult = {{ result | tojson }};
+    function verifyAndStoreOwnerSigninUrl(payload){
+      if(!payload){ return null; }
+      const raw = payload.owner_signin_url;
+      if(!raw){ return null; }
+      try{
+        const urlObj = new URL(raw, window.location.origin);
+        const normalized = urlObj.href;
+        payload.owner_signin_url = normalized;
+        try{
+          const key = `owner_signin_url:${payload.shop_id || "unknown"}`;
+          const entry = {
+            shop_id: payload.shop_id || null,
+            owner_signin_url: normalized,
+            saved_at: new Date().toISOString(),
+          };
+          localStorage.setItem(key, JSON.stringify(entry));
+        }catch(storageErr){
+          console.warn("store owner_signin_url failed", storageErr);
+        }
+        return normalized;
+      }catch(err){
+        console.error("owner_signin_url invalid", err);
+        return null;
+      }
+    }
+
+    function saveAdminOaNewResult(){
+      const payload = window.__adminOaNewResult;
+      if(!payload){
+        alert("ยังไม่มีข้อมูลใหม่ให้บันทึก");
+        return;
+      }
+      const verifiedUrl = verifyAndStoreOwnerSigninUrl(payload);
+      if(!verifiedUrl){
+        const confirmSave = confirm("ลิงก์ Owner Sign-in ไม่ถูกต้อง ต้องการบันทึกข้อมูลต่อหรือไม่?");
+        if(!confirmSave){
+          return;
+        }
+      }
+      try{
+        const blob = new Blob([JSON.stringify(payload, null, 2)], { type: "application/json" });
+        const filename = `shop_${payload.shop_id || "oa_new"}.json`;
+        const link = document.createElement("a");
+        link.href = URL.createObjectURL(blob);
+        link.download = filename;
+        document.body.appendChild(link);
+        link.click();
+        requestAnimationFrame(() => {
+          URL.revokeObjectURL(link.href);
+          link.remove();
+        });
+      }catch(err){
+        console.error("saveAdminOaNewResult failed", err);
+        alert("ไม่สามารถบันทึกไฟล์ได้");
+      }
+    }
+    window.addEventListener("load", () => {
+      if(window.__adminOaNewResult){
+        verifyAndStoreOwnerSigninUrl(window.__adminOaNewResult);
+        console.info("admin OA new ready", window.__adminOaNewResult.shop_id);
+      }
+    });
+  </script>
+  {% endif %}
 </body>
 </html>

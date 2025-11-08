@@ -960,6 +960,7 @@ def admin_create_oa():
                 }
                 if bot_user_id:
                     meta_payload["bot_user_id"] = bot_user_id
+                    oa_consumer["bot_user_id"] = bot_user_id
                 meta_payload["settings"] = firestore.DELETE_FIELD
                 meta_payload["oa_display_name"] = firestore.DELETE_FIELD
                 if not root_exists:
