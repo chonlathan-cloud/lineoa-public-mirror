@@ -1,0 +1,15 @@
+{
+  "shops/shop_00006/settings/default": {
+    "oa_consumer": {
+      "bot_user_id": "U6cac4c36b827c5bd703b19f603f815dd",
+      "line_channel_secret": "<from LINE console>",
+      "line_channel_access_token": "<from LINE console>",
+      "basic_id": "@363uonbm",
+      "display_name": "The Coffee 49",
+      "picture_url": "https://..."
+    },
+    "report_bucket": "lineoa-report-for-owner",
+    "media_bucket": "lineoa-media-dev",
+    "oa_display_name": "The Coffee 49"
+  }
+}

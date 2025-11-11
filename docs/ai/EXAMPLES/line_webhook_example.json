@@ -1,0 +1,20 @@
+{
+  "destination": "Uxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+  "events": [
+    {
+      "type": "message",
+      "message": {
+        "type": "text",
+        "id": "1",
+        "text": "เริ่มต้นใช้งาน"
+      },
+      "replyToken": "dummy",
+      "source": {
+        "type": "user",
+        "userId": "Uyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyy"
+      },
+      "timestamp": 1700000000000,
+      "mode": "active"
+    }
+  ]
+}

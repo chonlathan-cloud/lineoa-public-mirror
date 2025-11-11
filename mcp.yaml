@@ -1,0 +1,93 @@
+version: 1
+project: lineoa-g49
+description: >
+  MCP config for the LINE OA project. Provides read-only context from local docs,
+  source repo, Firestore, Storage, and Secret Manager (names only) so AI tools
+  (e.g., Copilot/ChatGPT) can understand the system without exposing secrets.
+
+providers:
+  # --- Local docs (AI Context Pack) ---
+  - name: docs
+    type: local.fs
+    root: docs/ai
+    read:
+      allow:
+        - "**/*.md"
+        - "**/*.json"
+        - "**/*.yml"
+        - "**/*.yaml"
+      deny: []
+
+  # --- Source repository (scoped) ---
+  - name: repo
+    type: local.fs
+    root: .
+    read:
+      allow:
+        - "admin/**/*.py"
+        - "consumer/**/*.py"
+        - "templates/**/*.html"
+        - "report_renderer.py"
+        - "lineoa_frontend.py"
+        - "app.py"
+        - "Dockerfile"
+        - "requirements.txt"
+        - "docs/**/*.md"
+        - ".github/**/*.yml"
+        - "scripts/**/*.sh"
+      deny:
+        - "**/.git/**"
+        - "**/__pycache__/**"
+        - "venv/**"
+        - "**/*.env"
+        - ".env"
+        - ".env.*"
+
+  # --- Firestore (read-only) ---
+  - name: firestore
+    type: gcp.firestore
+    project_id: lineoa-g49
+    mode: read
+    # (optional allowlists help AI discover schema faster)
+    collections_allow:
+      - "shops"
+      - "shops/*/customers"
+      - "shops/*/settings"
+      - "shops/*/owners"
+      - "owner_shops"
+      - "owner_shops/*/shops"
+      - "shops/*/report_requests"
+      - "shops/*/reports/requests/items"
+
+  # --- Cloud Storage: media bucket (read-only) ---
+  - name: storage_media
+    type: gcp.storage
+    mode: read
+    buckets:
+      - lineoa-media-dev
+
+  # --- Cloud Storage: report bucket (read-only) ---
+  - name: storage_reports
+    type: gcp.storage
+    mode: read
+    buckets:
+      - lineoa-report-for-owner
+
+  # --- Secret Manager: names only (no secret values) ---
+  - name: secrets
+    type: gcp.secretmanager
+    project_id: lineoa-g49
+    mode: meta            # 'meta' exposes names/versions, not values
+    allow:
+      - "MAGIC_LINK_SECRET"
+
+permissions:
+  # No network calls via MCP; AI uses only these providers as context
+  network: deny
+  # Disallow arbitrary command execution
+  exec: deny
+
+notes:
+  - "Use ADC (gcloud auth application-default login) or Cloud Workstation with proper IAM."
+  - "Firestore/Storage access is read-only; writes are intentionally not exposed."
+  - "Secret Manager is metadata only; no secret values are ever returned via MCP."
