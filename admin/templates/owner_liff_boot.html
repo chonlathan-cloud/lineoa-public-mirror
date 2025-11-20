@@ -7,26 +7,148 @@
   <title>Owner Sign-in • LINE OA</title>
   <script src="https://static.line-scdn.net/liff/edge/2/sdk.js"></script>
   <style>
-    :root{--brand:#008080;--accent:#F97316;}
-    body{margin:0;font:14px/1.5 -apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif;background:#F8F9FA;color:#111}
-    .wrap{max-width:720px;margin:24px auto;padding:0 16px}
-    .card{background:#fff;border:1px solid #e5e7eb;border-radius:12px;padding:18px}
-    h1{margin:0 0 8px 0;font-size:18px}
-    .muted{color:#6b7280}
-    .btn{display:inline-block;background:var(--accent);color:#111;border:none;border-radius:10px;padding:10px 14px;font-weight:700;cursor:pointer}
-    #err{color:#b91c1c}
+    :root{
+      --brand:#008080;
+      --accent:#F97316;
+      --bg:#F5F7FB;
+      --ink:#111827;
+    }
+    body{
+      margin:0;
+      min-height:100vh;
+      background:var(--bg);
+      font:15px/1.6 -apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif;
+      color:var(--ink);
+      display:flex;
+      align-items:center;
+      justify-content:center;
+      padding:24px 16px;
+    }
+    .page{
+      width:100%;
+      max-width:640px;
+      background:#fff;
+      border-radius:20px;
+      box-shadow:0 25px 60px rgba(15,23,42,0.12);
+      padding:32px 28px;
+      display:flex;
+      flex-direction:column;
+      gap:24px;
+    }
+    .hero{text-align:center}
+    .logo-circle{
+      width:200px;
+      height:180px;
+      display:flex;
+      align-items:center;
+      justify-content:center;
+      margin:0 auto 0px;
+    }
+    .logo-img{
+      width:200px;
+      height:auto;
+      display:block;
+    }
+    h1{margin:0;font-size:26px}
+    .tagline{margin:12px auto 0;color:#6b7280;line-height:1.6}
+    .highlight{
+      background:#F0FDF4;
+      border:1px solid #BBF7D0;
+      border-radius:16px;
+      padding:18px;
+      color:#14532D;
+    }
+    .highlight ul{margin:12px 0 0 18px;padding:0}
+    .highlight li{margin-bottom:6px}
+    .status-card{
+      background:#F9FAFB;
+      border-radius:14px;
+      padding:16px;
+      font-size:14px;
+      border:1px solid #E5E7EB;
+    }
+    #err{
+      color:#b91c1c;
+      white-space:pre-wrap;
+      margin:12px 0 0;
+      font-family:inherit;
+    }
+    .cta{text-align:center}
+    .btn{
+      border:none;
+      border-radius:999px;
+      padding:14px 28px;
+      font-size:15px;
+      font-weight:600;
+      background:var(--accent);
+      color:#111;
+      cursor:pointer;
+      transition:transform .15s, box-shadow .15s;
+    }
+    .btn:disabled{
+      opacity:.5;
+      cursor:default;
+      box-shadow:none !important;
+    }
+    .btn.active:hover{
+      transform:translateY(-1px);
+      box-shadow:0 12px 24px rgba(249,115,22,.35);
+    }
+    @media(max-width:520px){
+      .page{padding:28px 20px}
+    }
   </style>
 </head>
 <body>
-  <div class="wrap">
-    <div class="card">
-      <h1>กำลังลงชื่อเข้าใช้…</h1>
-      <p class="muted">โปรดรอสักครู่ ระบบกำลังตรวจสอบสิทธิ์เจ้าของร้าน</p>
-      <pre id="err" style="white-space:pre-wrap"></pre>
+  <div class="page">
+    <div class="hero">
+      <div class="logo-circle">
+        <img src="/static/logo.png" alt="MIA logo" class="logo-img">
+      </div>
+      <h1>ยินดีต้อนรับสู่ MIA 🎉</h1>
+      <p class="tagline">
+        ผู้ช่วยอัจฉริยะสำหรับธุรกิจของคุณ<br/>
+        ช่วยดูแลลูกค้า รายงาน และการเติบโตของร้านในที่เดียว
+      </p>
     </div>
+
+    <section class="highlight">
+      <p>จากวันนี้คุณสามารถใช้ MIA เพื่อ</p>
+      <ul>
+        <li>ดูภาพรวมลูกค้าจาก LINE OA ของร้าน</li>
+        <li>ติดตามยอดและกิจกรรมสำคัญของลูกค้า</li>
+        <li>เตรียมเชื่อมต่อ AI เพื่อช่วยตอบแชทและวิเคราะห์ข้อมูลในอนาคต</li>
+      </ul>
+    </section>
+
+    <div class="status-card">
+      <p id="status-text">กำลังตรวจสอบสิทธิ์เจ้าของร้าน โปรดรอสักครู่…</p>
+      <pre id="err"></pre>
+    </div>
+
+    <footer class="cta">
+      <button id="btn-open-shop" class="btn" disabled>เข้าสู่หน้าร้านของฉัน</button>
+    </footer>
   </div>
   <script>
     (async function(){
+      const statusEl = document.getElementById("status-text");
+      const errorEl = document.getElementById("err");
+      const openBtn = document.getElementById("btn-open-shop");
+      const setStatus = (text) => { if(statusEl){ statusEl.textContent = text; } };
+      const showError = (msg) => {
+        if(errorEl){
+          errorEl.textContent = msg;
+        } else {
+          alert(msg);
+        }
+      };
+      const enableButton = (cb) => {
+        if(!openBtn){ cb(); return; }
+        openBtn.disabled = false;
+        openBtn.classList.add("active");
+        openBtn.addEventListener("click", cb);
+      };
       try{
         const LIFF_IDS = {{ liff_ids|tojson }};
         if(!Array.isArray(LIFF_IDS) || LIFF_IDS.length === 0){
@@ -158,10 +280,23 @@
         }
         const js = await res.json();
         const fallback = nextParam || "/owner/promotions/form";
-        const to = (js && js.redirect) || fallback;
-        location.replace(to);
+        const targetUrl = (js && js.redirect) || fallback;
+        const navigate = () => {
+          if(window.liff && typeof liff.openWindow === "function"){
+            liff.openWindow({ url: targetUrl, external: false });
+          } else {
+            window.location.assign(targetUrl);
+          }
+        };
+        setStatus("พร้อมแล้ว กดปุ่มเพื่อเข้าสู่หน้าร้านของคุณ");
+        if(openBtn){
+          enableButton(navigate);
+        } else {
+          navigate();
+        }
       }catch(e){
-        document.getElementById("err").textContent = "เกิดข้อผิดพลาด: " + (e && e.message ? e.message : e);
+        setStatus("เกิดข้อผิดพลาด กรุณาลองใหม่อีกครั้ง");
+        showError("เกิดข้อผิดพลาด: " + (e && e.message ? e.message : e));
       }
     })();
   </script>

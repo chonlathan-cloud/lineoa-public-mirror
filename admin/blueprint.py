@@ -28,7 +28,7 @@ from dateutil import parser as _dtparser
 import os
 import traceback
 import uuid
-from urllib.parse import quote, urlparse, parse_qs, urlencode
+from urllib.parse import quote, urlparse, parse_qs
 # --- core shared modules (do not import consumer/admin crosswise) ---
 from core.line_events import check_signature as core_check_sig, extract_event_fields as core_extract, ensure_event_once as core_event_once
 from core.secrets import load_shop_context_by_destination as core_load_ctx, resolve_secret as core_resolve_secret
@@ -329,7 +329,7 @@ def _build_consumer_add_friend_link(settings: Optional[Dict[str, Any]]) -> Optio
         pass
     return None
 
-def _send_owner_invite_message(shop_id, settings, target_user_id, invite_url):
+def _send_owner_invite_message(shop_id, settings, target_user_id, invite_url, add_friend_url: Optional[str] = None):
     if not target_user_id:
         return False, "missing_target_user"
 
@@ -357,8 +357,15 @@ def _send_owner_invite_message(shop_id, settings, target_user_id, invite_url):
         # Continue anyway; some channels may restrict profile but still allow push
 
     try:
-        add_friend_url = _build_consumer_add_friend_link(settings)
+        add_friend_url = add_friend_url or _build_consumer_add_friend_link(settings)
         messages: List[Any] = []
+        if TextSendMessage:
+            intro_text = (
+                "🎉 ยินดีด้วยค่ะ! ร้านของคุณพร้อมใช้งานแล้ว\n\n"
+                "MIA ได้สร้าง LINE OA และตั้งค่าร้านให้เรียบร้อยแล้ว\n"
+                "คุณสามารถเข้าไปดูร้านของคุณได้ผ่านปุ่มหรือ QR ด้านล่างได้เลยนะคะ 😊"
+            )
+            messages.append(TextSendMessage(text=intro_text))
         has_link = bool(add_friend_url)
         has_qr = False
         if add_friend_url and TextSendMessage:
@@ -1019,6 +1026,7 @@ def admin_create_oa():
                 settings_ref = root_ref.collection("settings").document("default")
                 settings_ref.set(settings_payload, merge=True)
                 settings_saved = settings_ref.get().to_dict() or {}
+                add_friend_url = _build_consumer_add_friend_link(settings_saved)
 
                 logging.getLogger("admin-oa-new").info(
                     "create OA shop=%s line_oa_id=%s bot_user_id=%s",
@@ -1100,7 +1108,9 @@ def admin_create_oa():
                         pushed = False
                         push_error = None
                         if messaging_user_id:
-                            pushed, push_error = _send_owner_invite_message(shop_id, settings_saved, messaging_user_id, invite_url)
+                            pushed, push_error = _send_owner_invite_message(
+                                shop_id, settings_saved, messaging_user_id, invite_url, add_friend_url=add_friend_url
+                            )
                         invite_info = {
                             "url": invite_url,
                             "token": token,
@@ -1134,6 +1144,7 @@ def admin_create_oa():
                         "payment_promptpay": payment_payload.get("payment_promptpay"),
                         "payment_qr_url": payment_payload.get("payment_qr_url"),
                         "payment_note": payment_payload.get("payment_note"),
+                        "line_friend_url": add_friend_url,
                     }
                     send_register_summary_flex_to_owner(owner_user_id, shop_id, summary_payload)
 
@@ -1204,8 +1215,11 @@ def admin_manage_owners():
                 invite_url = _build_owner_invite_url(shop_id, token)
                 pushed = False
                 push_error = None
+                friend_url = _build_consumer_add_friend_link(settings)
                 if messaging_user:
-                    pushed, push_error = _send_owner_invite_message(shop_id, settings, messaging_user, invite_url)
+                    pushed, push_error = _send_owner_invite_message(
+                        shop_id, settings, messaging_user, invite_url, add_friend_url=friend_url
+                    )
                 invite_result = {
                     "url": invite_url,
                     "token": token,
@@ -1407,6 +1421,10 @@ def send_register_summary_flex_to_owner(owner_user_id: Optional[str], shop_id: s
     if summary.get("payment_note"):
         payment_lines.append(f"หมายเหตุ: {summary['payment_note']}")
     payment_text = "\n".join(payment_lines) if payment_lines else "-"
+    friend_url = (summary.get("line_friend_url") or "").strip()
+    if not friend_url:
+        # fallback to owner portal if LINE OA link missing
+        friend_url = _build_consumer_add_friend_link({"oa_consumer": {"basic_id": summary.get("line_oa")}})
     bubble = {
         "type": "bubble",
         "header": {
@@ -1435,12 +1453,11 @@ def send_register_summary_flex_to_owner(owner_user_id: Optional[str], shop_id: s
             "layout": "vertical",
             "spacing": "md",
             "contents": [
-                {"type": "text", "text": "หากทุกอย่างถูกต้องให้กด “ยืนยัน” หรือกด “ยกเลิก / แก้ไขข้อมูล” เพื่อแจ้งทีมงาน", "wrap": True, "size": "xs", "color": "#888888"},
+                {"type": "text", "text": "แตะปุ่มด้านล่างเพื่อเปิดดูร้านของคุณบน LINE OA ได้เลยค่ะ", "wrap": True, "size": "xs", "color": "#888888"},
                 {"type": "button", "style": "primary", "height": "sm",
-                 "action": {"type": "postback", "label": "ยืนยัน", "data": urlencode({"action": "register_confirm", "shop_id": shop_id})}},
-                {"type": "button", "style": "secondary", "height": "sm",
-                 "action": {"type": "postback", "label": "ยกเลิก / แก้ไขข้อมูล", "data": urlencode({"action": "register_edit", "shop_id": shop_id})}}
-            ]
+                 "action": {"type": "uri", "label": "ไปที่ร้านของคุณ", "uri": friend_url or ADMIN_BASE_URL}}
+            ],
+            "flex": 0
         }
     }
     try:
