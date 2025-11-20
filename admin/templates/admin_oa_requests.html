@@ -38,6 +38,7 @@
           <th>ผู้ติดต่อ</th>
           <th>เบอร์โทร</th>
           <th>LINE User</th>
+          <th>ช่องทางรับเงิน</th>
           <th>สร้างเมื่อ</th>
           <th>ดำเนินการ</th>
         </tr>
@@ -51,13 +52,27 @@
               <td>{{ row.name or "-" }}</td>
               <td>{{ row.phone or "-" }}</td>
               <td>{{ row.messaging_user_id or "-" }}</td>
+              <td>
+                {% if row.payment_promptpay %}
+                  <div>PromptPay: {{ row.payment_promptpay }}</div>
+                {% endif %}
+                {% if row.payment_note %}
+                  <div class="muted">หมายเหตุ: {{ row.payment_note }}</div>
+                {% endif %}
+                {% if row.payment_qr_url %}
+                  <div><a class="link" href="{{ row.payment_qr_url }}" target="_blank">ดู QR</a></div>
+                {% endif %}
+                {% if not row.payment_promptpay and not row.payment_note and not row.payment_qr_url %}
+                  <span class="muted">-</span>
+                {% endif %}
+              </td>
               <td>{{ row.created_at or "-" }}</td>
               <td><a class="link" href="/admin/oa/new?prefill={{ row.id }}">ใช้ข้อมูลนี้</a></td>
             </tr>
           {% endfor %}
         {% else %}
           <tr>
-            <td colspan="6">ยังไม่มีคำขอรออนุมัติ</td>
+            <td colspan="8">ยังไม่มีคำขอรออนุมัติ</td>
           </tr>
         {% endif %}
       </tbody>

@@ -132,6 +132,7 @@
 </head>
 <body>
   <div class="wrap">
+    {% set prefill_payment = (prefill_data.payment if prefill_data else {}) or {} %}
     <h1>ลงทะเบียน LINE OA ใหม่ (Admin)</h1>
 
     {% if errors %}
@@ -145,7 +146,7 @@
       </div>
     {% endif %}
 
-    <form method="post" class="card">
+    <form method="post" class="card" enctype="multipart/form-data">
       <input type="hidden" name="prefill_id" value="{{ prefill_id }}">
       <div class="section-title">ค่า Global (อ่านอย่างเดียว)</div>
       <div class="grid">
@@ -195,6 +196,16 @@
             {% if prefill_data.messaging_user_id %}
               <div><strong>LINE user ID:</strong> {{ prefill_data.messaging_user_id }}</div>
             {% endif %}
+            {% if prefill_payment.payment_promptpay or prefill_payment.payment_note or prefill_payment.payment_qr_url %}
+              <div style="margin-top:6px">
+                <strong>ข้อมูลการรับเงิน:</strong>
+                <div class="muted" style="margin-top:4px">
+                  {% if prefill_payment.payment_promptpay %}<div>PromptPay/บัญชี: {{ prefill_payment.payment_promptpay }}</div>{% endif %}
+                  {% if prefill_payment.payment_note %}<div>หมายเหตุ: {{ prefill_payment.payment_note }}</div>{% endif %}
+                  {% if prefill_payment.payment_qr_url %}<div>QR code: <a href="{{ prefill_payment.payment_qr_url }}" target="_blank">เปิดดู</a></div>{% endif %}
+                </div>
+              </div>
+            {% endif %}
           </div>
           <div>
             <a class="muted" href="/admin/oa/requests" style="text-decoration:none;">เปลี่ยนคำขอ</a>
@@ -224,6 +235,19 @@
 
       <label style="margin-top:16px;">Channel Secret *</label>
       <textarea name="line_channel_secret" placeholder="Channel secret (one-time)" required></textarea>
+
+      <hr style="margin:20px -20px; border:none; border-top:1px solid var(--border);">
+      <div class="section-title">ช่องทางรับเงินจากลูกค้า</div>
+      <p class="muted">กรุณาระบุอย่างน้อย 1 วิธี เช่น หมายเลข PromptPay/บัญชีธนาคาร หรืออัปโหลดรูป QR code สามารถกรอกทั้งสองอย่างได้</p>
+      <label>PromptPay / หมายเลขบัญชี</label>
+      <input type="text" name="payment_promptpay" value="{{ form.payment_promptpay }}" placeholder="เช่น 0812345678 หรือ 123-4-56789-0">
+      <label style="margin-top:12px;">อัปโหลด QR code (PNG/JPG)</label>
+      <input type="file" name="payment_qr_file" accept="image/png,image/jpeg">
+      {% if prefill_payment.payment_qr_url %}
+        <p class="muted">มีไฟล์จากคำขอก่อนหน้า: <a href="{{ prefill_payment.payment_qr_url }}" target="_blank">เปิดดู QR เดิม</a></p>
+      {% endif %}
+      <label style="margin-top:12px;">หมายเหตุ (เช่น ชื่อบัญชี/ธนาคาร)</label>
+      <textarea name="payment_note" placeholder="รายละเอียดเพิ่มเติมเกี่ยวกับการรับเงิน" rows="3">{{ form.payment_note }}</textarea>
 
       <div style="margin-top:20px;">
         <button type="submit" class="btn">บันทึก OA ใหม่</button>

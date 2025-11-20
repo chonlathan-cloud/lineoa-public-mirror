@@ -28,7 +28,7 @@ from dateutil import parser as _dtparser
 import os
 import traceback
 import uuid
-from urllib.parse import quote, urlparse, parse_qs
+from urllib.parse import quote, urlparse, parse_qs, urlencode
 # --- core shared modules (do not import consumer/admin crosswise) ---
 from core.line_events import check_signature as core_check_sig, extract_event_fields as core_extract, ensure_event_once as core_event_once
 from core.secrets import load_shop_context_by_destination as core_load_ctx, resolve_secret as core_resolve_secret
@@ -38,11 +38,12 @@ from core.payments import parse_payment_intent as core_parse_intent, create_or_a
 from werkzeug.utils import secure_filename
 try:
     from linebot import LineBotApi
-    from linebot.models import TextSendMessage, ImageSendMessage
+    from linebot.models import TextSendMessage, ImageSendMessage, FlexSendMessage
 except Exception:
     LineBotApi = None  # optional
     TextSendMessage = None
     ImageSendMessage = None
+    FlexSendMessage = None
 try:
     from dao import get_shop_settings, get_shop, upsert_owner_shop_link  # reuse DAO helpers when available
 except Exception:
@@ -803,6 +804,7 @@ def admin_onboarding_requests():
             created = data.get("created_at")
             if hasattr(created, "isoformat"):
                 created = created.isoformat()
+            payment_map = data.get("payment") or {}
             rows.append({
                 "id": doc.id,
                 "name": data.get("name"),
@@ -810,6 +812,9 @@ def admin_onboarding_requests():
                 "shop": data.get("shop"),
                 "messaging_user_id": data.get("messaging_user_id") or data.get("user_id"),
                 "created_at": created,
+                "payment_promptpay": payment_map.get("payment_promptpay"),
+                "payment_qr_url": payment_map.get("payment_qr_url"),
+                "payment_note": payment_map.get("payment_note"),
             })
     except Exception as exc:
         error = str(exc)
@@ -873,15 +878,20 @@ def admin_create_oa():
                 errors.append("ไม่พบคำขอ onboarding ที่เลือกไว้")
         except Exception as exc:
             errors.append(f"ไม่สามารถอ่านข้อมูลสำหรับ prefill ได้: {exc}")
+    prefill_payment: Dict[str, Any] = (prefill_data.get("payment") or {}) if isinstance(prefill_data, dict) else {}
     default_form = {
         "channel_id": "",
         "oa_display_name": "",
         "line_oa_id": "",
+        "payment_promptpay": "",
+        "payment_note": "",
     }
     form = default_form.copy()
 
     if request.method == "GET" and prefill_data:
         form["oa_display_name"] = prefill_data.get("shop") or ""
+        form["payment_promptpay"] = prefill_payment.get("payment_promptpay") or ""
+        form["payment_note"] = prefill_payment.get("payment_note") or ""
 
     if request.method == "POST":
         channel_id = (request.form.get("channel_id") or "").strip()
@@ -889,12 +899,37 @@ def admin_create_oa():
         line_access_token = (request.form.get("line_channel_access_token") or "").strip()
         line_channel_secret = (request.form.get("line_channel_secret") or "").strip()
         line_oa_id = (request.form.get("line_oa_id") or "").strip()
+        payment_promptpay = (request.form.get("payment_promptpay") or "").strip()
+        payment_note = (request.form.get("payment_note") or "").strip()
+        payment_qr_file = request.files.get("payment_qr_file")
 
         form.update({
             "channel_id": channel_id,
             "oa_display_name": oa_display_name,
             "line_oa_id": line_oa_id,
+            "payment_promptpay": payment_promptpay,
+            "payment_note": payment_note,
         })
+
+        payment_qr_upload: Optional[Dict[str, Any]] = None
+        existing_payment_qr_url = (prefill_payment.get("payment_qr_url") or "").strip() or None
+        if payment_qr_file and getattr(payment_qr_file, "filename", ""):
+            filename = secure_filename(payment_qr_file.filename)
+            ext = filename.rsplit(".", 1)[-1].lower() if "." in filename else ""
+            if ext not in ("png", "jpg", "jpeg"):
+                errors.append("QR code image ต้องเป็นไฟล์ PNG หรือ JPG เท่านั้น")
+            else:
+                data = payment_qr_file.read()
+                if not data:
+                    errors.append("ไฟล์ QR code ว่างเปล่า กรุณาอัปโหลดใหม่")
+                else:
+                    canonical_ext = ".png" if ext == "png" else ".jpg"
+                    ct = payment_qr_file.mimetype or ("image/png" if canonical_ext == ".png" else "image/jpeg")
+                    payment_qr_upload = {
+                        "data": data,
+                        "content_type": ct,
+                        "ext": canonical_ext,
+                    }
 
         if not channel_id:
             errors.append("Channel ID is required.")
@@ -902,6 +937,8 @@ def admin_create_oa():
             errors.append("LINE channel access token is required.")
         if not line_channel_secret:
             errors.append("LINE channel secret is required.")
+        if not payment_promptpay and not payment_qr_upload and not existing_payment_qr_url:
+            errors.append("กรุณาระบุ PromptPay/เลขบัญชี หรืออัปโหลดรูป QR code อย่างน้อย 1 วิธีสำหรับการรับเงินจากลูกค้า")
 
         try:
             int(channel_id)
@@ -926,6 +963,18 @@ def admin_create_oa():
                     "media_bucket": media_bucket or "lineoa-media-dev",
                     "report_bucket": report_bucket or "lineoa-report-for-owner",
                 }
+                payment_qr_url = existing_payment_qr_url
+                if payment_qr_upload:
+                    uploaded_qr_url = _store_payment_qr_for_shop(shop_id, payment_qr_upload)
+                    if not uploaded_qr_url:
+                        raise RuntimeError("payment_qr_upload_failed")
+                    payment_qr_url = uploaded_qr_url
+                payment_payload = {
+                    "payment_promptpay": payment_promptpay or None,
+                    "payment_qr_url": payment_qr_url or None,
+                    "payment_note": payment_note or None,
+                }
+                settings_payload["payment"] = payment_payload
 
                 # --- Auto-populate bot identity from /v2/bot/info ---
                 bot_info = _fetch_bot_info_v2(line_access_token)
@@ -1004,6 +1053,7 @@ def admin_create_oa():
                             "shop_id": shop_id,
                             "approved_at": now,
                             "updated_at": now,
+                            "payment": payment_payload,
                         }, merge=True)
                         profile_payload = {
                             "name": prefill_data.get("name"),
@@ -1068,11 +1118,34 @@ def admin_create_oa():
                     if invite_info:
                         result["invite_info"] = invite_info
 
+                owner_user_id = (prefill_data.get("messaging_user_id") or prefill_data.get("user_id") or "").strip() if prefill_data else ""
+                if owner_user_id:
+                    loc = (prefill_data.get("location") if prefill_data else None) or {}
+                    location_label = None
+                    if isinstance(loc, dict):
+                        location_label = loc.get("address") or loc.get("title")
+                    if not location_label:
+                        location_label = "ร้านออนไลน์"
+                    summary_payload = {
+                        "shop_name": ((prefill_data.get("shop") if prefill_data else None) or final_display_name or shop_id),
+                        "line_oa": (oa_consumer.get("basic_id") or oa_consumer.get("display_name") or form.get("oa_display_name") or line_oa_id or channel_id_str),
+                        "phone": prefill_data.get("phone") if prefill_data else None,
+                        "location": location_label,
+                        "payment_promptpay": payment_payload.get("payment_promptpay"),
+                        "payment_qr_url": payment_payload.get("payment_qr_url"),
+                        "payment_note": payment_payload.get("payment_note"),
+                    }
+                    send_register_summary_flex_to_owner(owner_user_id, shop_id, summary_payload)
+
                 # Clear sensitive fields from form after success
                 form = default_form.copy()
             except Exception as exc:
-                log.error("admin oa new failed: %s", exc, exc_info=True)
-                errors.append("Failed to create the shop. Please try again or contact the platform team.")
+                if str(exc) == "payment_qr_upload_failed":
+                    log.warning("payment qr upload failed during shop creation")
+                    errors.append("ไม่สามารถอัปโหลดไฟล์ QR การรับเงินได้ กรุณาลองใหม่")
+                else:
+                    log.error("admin oa new failed: %s", exc, exc_info=True)
+                    errors.append("Failed to create the shop. Please try again or contact the platform team.")
 
     status_code = 200 if not errors else 400 if request.method == "POST" and not result else 200
     return render_template(
@@ -1282,6 +1355,103 @@ def _upload_images_from_request(prefix: str) -> list[str]:
         return urls
     except Exception:
         return []
+
+def _store_payment_qr_for_shop(shop_id: str, payload: Dict[str, Any]) -> Optional[str]:
+    bucket_name = (os.getenv("MEDIA_BUCKET") or os.getenv("REPORT_BUCKET"))
+    data = (payload or {}).get("data")
+    if not bucket_name or not data:
+        return None
+    ext = (payload.get("ext") if isinstance(payload, dict) else None) or ".png"
+    content_type = (payload.get("content_type") if isinstance(payload, dict) else None) or ("image/jpeg" if ext == ".jpg" else "image/png")
+    ts = datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S")
+    blob_path = f"media/shops/{shop_id}/payment_qr_{ts}{ext}"
+    try:
+        client = storage.Client()
+        bucket = client.bucket(bucket_name)
+        blob = bucket.blob(blob_path)
+        try:
+            blob.cache_control = "public, max-age=86400"
+        except Exception:
+            pass
+        blob.upload_from_string(data, content_type=content_type)
+        public_base = os.getenv("MEDIA_PUBLIC_BASE") or f"https://storage.googleapis.com/{bucket_name}"
+        return f"{public_base.rstrip('/')}/{blob_path}"
+    except Exception as err:
+        logging.getLogger("admin-oa-new").warning("payment qr upload failed shop=%s err=%s", shop_id, err)
+        return None
+
+
+def send_register_summary_flex_to_owner(owner_user_id: Optional[str], shop_id: str, summary: Dict[str, Any]) -> bool:
+    log = logging.getLogger("admin-oa-new")
+    if not owner_user_id:
+        log.warning("skip flex summary (missing owner user id) shop=%s", shop_id)
+        return False
+    if not (ADMIN_LINE_TOKEN and LineBotApi and FlexSendMessage):
+        log.warning("skip flex summary (LINE API unavailable) shop=%s", shop_id)
+        return False
+    def _kv(label: str, value: Optional[str]) -> Dict[str, Any]:
+        return {
+            "type": "box",
+            "layout": "baseline",
+            "spacing": "sm",
+            "contents": [
+                {"type": "text", "text": label, "flex": 3, "size": "sm", "color": "#888888"},
+                {"type": "text", "text": value or "-", "flex": 5, "size": "sm", "wrap": True}
+            ]
+        }
+    payment_lines: List[str] = []
+    if summary.get("payment_promptpay"):
+        payment_lines.append(f"PromptPay: {summary['payment_promptpay']}")
+    if summary.get("payment_qr_url"):
+        payment_lines.append("QR code: แนบแล้ว")
+    if summary.get("payment_note"):
+        payment_lines.append(f"หมายเหตุ: {summary['payment_note']}")
+    payment_text = "\n".join(payment_lines) if payment_lines else "-"
+    bubble = {
+        "type": "bubble",
+        "header": {
+            "type": "box",
+            "layout": "vertical",
+            "contents": [
+                {"type": "text", "text": "ตรวจสอบข้อมูลร้าน", "weight": "bold", "size": "md"}
+            ]
+        },
+        "body": {
+            "type": "box",
+            "layout": "vertical",
+            "spacing": "sm",
+            "contents": [
+                {"type": "text", "text": summary.get("shop_name") or shop_id, "weight": "bold", "size": "xl", "wrap": True},
+                {"type": "separator", "margin": "md"},
+                _kv("LINE OA", summary.get("line_oa")),
+                _kv("เบอร์โทร", summary.get("phone")),
+                _kv("ที่ตั้ง", summary.get("location")),
+                {"type": "text", "text": "ช่องทางรับเงิน", "weight": "bold", "size": "sm", "color": "#444444", "margin": "md"},
+                {"type": "text", "text": payment_text, "wrap": True, "size": "sm", "color": "#444444"}
+            ]
+        },
+        "footer": {
+            "type": "box",
+            "layout": "vertical",
+            "spacing": "md",
+            "contents": [
+                {"type": "text", "text": "หากทุกอย่างถูกต้องให้กด “ยืนยัน” หรือกด “ยกเลิก / แก้ไขข้อมูล” เพื่อแจ้งทีมงาน", "wrap": True, "size": "xs", "color": "#888888"},
+                {"type": "button", "style": "primary", "height": "sm",
+                 "action": {"type": "postback", "label": "ยืนยัน", "data": urlencode({"action": "register_confirm", "shop_id": shop_id})}},
+                {"type": "button", "style": "secondary", "height": "sm",
+                 "action": {"type": "postback", "label": "ยกเลิก / แก้ไขข้อมูล", "data": urlencode({"action": "register_edit", "shop_id": shop_id})}}
+            ]
+        }
+    }
+    try:
+        api = LineBotApi(ADMIN_LINE_TOKEN)
+        flex = FlexSendMessage(alt_text="กรุณายืนยันข้อมูลร้าน", contents=bubble)
+        api.push_message(owner_user_id, flex)
+        log.info("pushed register summary flex shop=%s owner=%s", shop_id, owner_user_id)
+        return True
+    except Exception as err:
+        log.warning("send flex summary failed shop=%s owner=%s err=%s", shop_id, owner_user_id, err)
+        return False
 
 def _now_utc():
     return datetime.now(timezone.utc)

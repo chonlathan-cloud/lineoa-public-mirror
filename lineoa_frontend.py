@@ -17,7 +17,7 @@ from urllib.error import HTTPError, URLError
 import re
 import io
 import base64, json, os, logging
-from urllib.parse import quote as _q
+from urllib.parse import quote as _q, parse_qs as _parse_qs
 # Try to import heavy report renderer (uses matplotlib); fall back to a tiny ReportLab-only stub if unavailable
 try:
     from report_renderer import build_report_pdf_v3, _build_report_pdf_weasy  # preferred (may import matplotlib)
@@ -61,7 +61,6 @@ try:
     _STORAGE_AVAILABLE = True
 except Exception:
     _STORAGE_AVAILABLE = False
-
 from flask import Flask, request, abort, jsonify
 from flask_cors import CORS
 from dao import (
@@ -80,23 +79,32 @@ from dao import (
     find_latest_pending_intent, confirm_latest_pending_intent_to_payment, reject_latest_pending_intent, attach_recent_intent_by_user,
     find_recent_pending_magic_link, bind_owner, mark_magic_link_used,
 )
-from admin.onboarding import (
-    get_session, save_session, clear_session,
-    upload_logo_bytes, finalize_request_from_session, to_flex_summary
-)
+try:
+    from admin.onboarding import (
+        get_session, save_session, clear_session,
+        upload_logo_bytes, upload_payment_qr_bytes,
+        finalize_request_from_session, to_flex_summary,
+    )
+except Exception:
+    from onboarding import (
+        get_session, save_session, clear_session,
+        upload_logo_bytes, upload_payment_qr_bytes,
+        finalize_request_from_session, to_flex_summary,
+    )
 
 from firestore_client import get_db
 
 # Optional LINE reply (created per-tenant only when needed)
 try:
     from linebot import LineBotApi
-    from linebot.models import TextSendMessage, QuickReply, QuickReplyButton, MessageAction
+    from linebot.models import TextSendMessage, QuickReply, QuickReplyButton, MessageAction, FlexSendMessage
 except Exception:
     LineBotApi = None  # optional
     TextSendMessage = None
     QuickReply = None
     QuickReplyButton = None
     MessageAction = None
+    FlexSendMessage = None
 
 # --- LINE profile helper ---
 from typing import Tuple
@@ -1050,102 +1058,339 @@ def line_webhook():
         logger.warning("invalid signature %s", _log_ctx(shop_id=shop_id))
         abort(400, "Invalid signature")
 
-    events: List[Dict[str, Any]] = body.get("events", [])
+    events: List[Dict[str, Any]] = body.get("events", []) or []
     for ev in events:
         user_id = None
         event_id = None
         message_id = None
-        try:
-            ev_type = ev.get("type")
-            msg = ev.get("message", {}) or {}
-            mtype = msg.get("type")
-            user_id = (ev.get("source", {}) or {}).get("userId", "")
-            event_id = ev.get("webhookEventId") or msg.get("id") or ev.get("replyToken")
-            message_id = msg.get("id")
-            replyToken = ev.get("replyToken")
 
-            if ev_type != "message":
-                logger.info("skip non-message %s %s", ev_type, _log_ctx(shop_id, user_id, event_id, message_id))
-                continue
-            if not user_id:
-                logger.warning("missing userId %s", _log_ctx(shop_id, None, event_id, message_id))
-                continue
+        ev_type = ev.get("type")
+        msg = ev.get("message") or {}
+        postback = ev.get("postback") or {}
+        mtype = msg.get("type")
+        user_id = (ev.get("source") or {}).get("userId", "")
+        event_id = ev.get("webhookEventId") or msg.get("id") or ev.get("replyToken")
+        message_id = msg.get("id")
+        replyToken = ev.get("replyToken")
+        onboarding_handled = False
 
-            # Idempotency per shop
+        # --- Admin postback branch for Task 2 (confirm/edit) ---
+        if ev_type == "postback":
+            data = (postback.get("data") or "").strip()
+            if not data:
+                logger.warning(
+                    "postback missing data %s",
+                    _log_ctx(shop_id, user_id, event_id, message_id),
+                )
+                continue
             try:
                 is_new = ensure_event_once(shop_id, event_id)
             except Exception as e:
-                logger.warning("ensure_event_once failed: %s %s", e, _log_ctx(shop_id, user_id, event_id, message_id))
+                logger.warning(
+                    "ensure_event_once failed(postback): %s %s",
+                    e,
+                    _log_ctx(shop_id, user_id, event_id, message_id),
+                )
                 is_new = True
             if not is_new:
-                logger.info("duplicate event ignored %s", _log_ctx(shop_id, user_id, event_id, message_id))
+                logger.info(
+                    "duplicate postback ignored %s",
+                    _log_ctx(shop_id, user_id, event_id, message_id),
+                )
+                continue
+            if oa_ctx != "admin":
+                logger.info(
+                    "postback skipped (ctx=%s) %s",
+                    oa_ctx,
+                    _log_ctx(shop_id, user_id, event_id, message_id),
+                )
+                continue
+            try:
+                params = _parse_qs(data)
+            except Exception as e:
+                logger.warning(
+                    "postback parse failed: %s %s",
+                    e,
+                    _log_ctx(shop_id, user_id, event_id, message_id),
+                )
                 continue
 
-            # owner?
-            owner = False
+            action = ""
+            action_vals = params.get("action") or []
+            if action_vals:
+                action = (action_vals[0] or "").strip()
+            shop_ref_vals = params.get("shop_id") or []
+            target_shop = (shop_ref_vals[0] or "").strip() if shop_ref_vals else ""
+
+            if action not in ("register_confirm", "register_edit"):
+                logger.info(
+                    "postback ignored action=%s %s",
+                    action,
+                    _log_ctx(shop_id, user_id, event_id, message_id),
+                )
+                continue
+            if not replyToken:
+                logger.warning(
+                    "postback missing replyToken %s",
+                    _log_ctx(shop_id, user_id, event_id, message_id),
+                )
+                continue
+            if not access_token or not LineBotApi or not TextSendMessage:
+                logger.warning(
+                    "postback reply unavailable (token/sdk missing) %s",
+                    _log_ctx(shop_id, user_id, event_id, message_id),
+                )
+                continue
             try:
-                owner = is_owner_user(shop_id, user_id)
+                api = LineBotApi(access_token)
             except Exception as e:
-                logger.warning("is_owner_user check failed: %s %s", e, _log_ctx(shop_id, user_id, event_id, message_id))
-            if not owner:
-                try:
-                    bound = _auto_bind_owner_if_needed(shop_id, user_id, settings)
-                    if bound:
-                        owner = True
-                        logger.info("auto-bind owner success %s", _log_ctx(shop_id, user_id, event_id, message_id))
-                except Exception as e:
-                    logger.warning("auto-bind failed: %s %s", e, _log_ctx(shop_id, user_id, event_id, message_id))
+                logger.warning(
+                    "postback api init failed: %s %s",
+                    e,
+                    _log_ctx(shop_id, user_id, event_id, message_id),
+                )
+                continue
 
-            api = None
-            if access_token and LineBotApi:
-                try:
-                    api = LineBotApi(access_token)
-                except Exception as e:
-                    logger.warning("LineBotApi init failed: %s %s", e, _log_ctx(shop_id, user_id, event_id, message_id))
+            if action == "register_confirm":
+                reply_text = (
+                    "ขอบคุณค่ะ 🎉 MIA ได้รับข้อมูลของร้านคุณเรียบร้อยแล้ว "
+                    "กำลังดำเนินการเปิดใช้งานให้เร็วที่สุด"
+                )
+            else:
+                reply_text = (
+                    "หากต้องการแก้ไขข้อมูล แจ้งรายละเอียดที่ต้องการแก้ในแชตนี้ได้เลยค่ะ "
+                    "ทีม MIA จะช่วยอัปเดตให้ 🙌"
+                )
 
-            # ensure customer exists/updated (also fetch LINE profile once)
             try:
-                prof = _fetch_line_profile(access_token, user_id)
-                display_name = prof.get("display_name")
-                if display_name:
-                    logger.info("fetched profile %s display_name=%s", _log_ctx(shop_id, user_id, event_id, message_id), display_name)
-                upsert_customer(shop_id, user_id, display_name=display_name)
+                api.reply_message(replyToken, TextSendMessage(text=reply_text))
+                logger.info(
+                    "admin register postback handled action=%s target_shop=%s %s",
+                    action,
+                    target_shop or shop_id,
+                    _log_ctx(shop_id, user_id, event_id, message_id),
+                )
             except Exception as e:
-                logger.warning("upsert_customer failed %s %s", e, _log_ctx(shop_id, user_id, event_id, message_id))
+                logger.warning(
+                    "postback reply failed action=%s err=%s %s",
+                    action,
+                    e,
+                    _log_ctx(shop_id, user_id, event_id, message_id),
+                )
+            # postback already handled; go to next event
+            continue
 
-            text = (msg.get("text") or "").strip()
-            low_txt = text.lower()
-            sess: Dict[str, Any] = {}
-            step = 0
-            if not owner:
+        # --- Non-postback branch; must be a message ---
+        if ev_type != "message":
+            logger.info(
+                "skip non-message %s %s",
+                ev_type,
+                _log_ctx(shop_id, user_id, event_id, message_id),
+            )
+            continue
+
+        # Must be a message event from this point forward
+        if not user_id:
+            logger.warning(
+                "missing userId %s",
+                _log_ctx(shop_id, None, event_id, message_id),
+            )
+            continue
+
+        # Event idempotency check
+        try:
+            is_new = ensure_event_once(shop_id, event_id)
+        except Exception as e:
+            logger.warning("ensure_event_once failed: %s %s", e, _log_ctx(shop_id, user_id, event_id, message_id))
+            is_new = True
+        if not is_new:
+            logger.info("duplicate event ignored %s", _log_ctx(shop_id, user_id, event_id, message_id))
+            continue
+        
+        # owner?
+        owner = False
+        try:
+            owner = is_owner_user(shop_id, user_id)
+        except Exception as e:
+            logger.warning("is_owner_user check failed: %s %s", e, _log_ctx(shop_id, user_id, event_id, message_id))        
+        if not owner:
+            try:
+                bound = _auto_bind_owner_if_needed(shop_id, user_id, settings)
+                if bound:
+                    owner = True
+                    logger.info("auto-bind owner success %s", _log_ctx(shop_id, user_id, event_id, message_id))
+            except Exception as e:
+                logger.warning("auto-bind failed: %s %s", e, _log_ctx(shop_id, user_id, event_id, message_id))
+
+        api = None
+        if access_token and LineBotApi:
+            try:
+                api = LineBotApi(access_token)
+            except Exception as e:
+                logger.warning("LineBotApi init failed: %s %s", e, _log_ctx(shop_id, user_id, event_id, message_id))
+
+        def _reply_line(messages):
+            if not replyToken or not api:
+                logger.warning("skip reply (LINE client unavailable) %s", _log_ctx(shop_id, user_id, event_id))
+                return False
+            try:
+                msg_list = messages if isinstance(messages, list) else [messages]
+                api.reply_message(replyToken, msg_list)
+                return True
+            except Exception as err:
+                logger.warning("reply failed: %s %s", err, _log_ctx(shop_id, user_id, event_id, message_id))
+                return False
+
+        def _qr_text(msg: str, add_online: bool = False):
+            if not TextSendMessage:
+                return None
+            if QuickReply and QuickReplyButton and MessageAction:
+                items = [QuickReplyButton(action=MessageAction(label="ยกเลิก", text="ยกเลิก"))]
+                if add_online:
+                    items.append(QuickReplyButton(action=MessageAction(label="ร้านออนไลน์", text="ร้านออนไลน์")))
+                return TextSendMessage(text=msg, quick_reply=QuickReply(items=items))
+            return TextSendMessage(text=msg)
+
+        def _reply_text_simple(message: str) -> bool:
+            if not TextSendMessage:
+                return False
+            return _reply_line(TextSendMessage(text=message))
+
+        def _send_onboarding_summary(session: Dict[str, Any]) -> bool:
+            try:
+                summary = to_flex_summary(session)
+            except Exception as err:
+                logger.warning(
+                    "build onboarding summary failed: %s %s",
+                    err,
+                    _log_ctx(shop_id, user_id, event_id, message_id),
+                )
+                summary = None
+            if not summary:
+                return False
+            if FlexSendMessage and summary.get("contents"):
                 try:
-                    sess = get_session(user_id) or {}
-                    step = int(sess.get("step") or 0)
-                    if user_id and sess and not sess.get("messaging_user_id"):
-                        sess["messaging_user_id"] = user_id
-                        save_session(user_id, sess)
-                except Exception as e:
-                    logger.warning("onboarding get_session failed: %s %s", e, _log_ctx(shop_id, user_id))
-                    sess = {}
-                    step = 0
-            low_txt = (text or "").strip().lower()
-            start_keywords = ("เริ่มต้นใช้งาน", "เริ่มต้นเปิดร้านของคุณ")
-            is_admin_start = (oa_ctx == "admin") and any(k in low_txt for k in start_keywords)
-            logger.info("DEBUG owner-flow ctx=%s owner=%s step=%s is_admin_start=%s",
-                        oa_ctx, bool(owner), step, is_admin_start)
-            owner_prompt_msg = None
+                    flex_msg = FlexSendMessage(
+                        alt_text=summary.get("altText") or "สรุปข้อมูลร้านค้า",
+                        contents=summary["contents"],
+                    )
+                    _reply_line(flex_msg)
+                    return True
+                except Exception as err:
+                    logger.warning(
+                        "send onboarding flex failed: %s %s",
+                        err,
+                        _log_ctx(shop_id, user_id, event_id, message_id),
+                    )
+            if TextSendMessage:
+                fallback_msg = TextSendMessage(
+                    text="รับข้อมูลครบแล้วค่ะ ตรวจสอบรายละเอียดให้เรียบร้อย จากนั้นกดปุ่ม “ยืนยันข้อมูล” หรือ “แก้ไขข้อมูล” ได้เลยนะคะ"
+                )
+                _reply_line(fallback_msg)
+                return True
+            return False
 
-            # --- Auto-owner bootstrap via "เริ่มต้นใช้งาน" on consumer OA ---
-            try:
-                t_start = (text or "").strip()
-            except Exception:
-                t_start = ""
-            try:
-                is_admin_start = bool(is_admin_start)
-            except Exception:
-                is_admin_start = False
+        # ensure customer exists/updated (also fetch LINE profile once)
+        try:
+            prof = _fetch_line_profile(access_token, user_id)
+            display_name = prof.get("display_name")
+            if display_name:
+                logger.info("fetched profile %s display_name=%s", _log_ctx(shop_id, user_id, event_id, message_id), display_name)
+            upsert_customer(shop_id, user_id, display_name=display_name)
+        except Exception as e:
+            logger.warning("upsert_customer failed %s %s", e, _log_ctx(shop_id, user_id, event_id, message_id))
 
-            if (oa_ctx == "consumer") and (t_start in ("เริ่มต้นใช้งาน", "เริ่มต้น", "start", "Start")) and (not is_admin_start):
+        text = (msg.get("text") or "").strip()
+        low_txt = text.lower()
+        sess: Dict[str, Any] = {}
+        step = 0
+        if not owner:
+            try:
+                sess = get_session(user_id) or {}
+                step = int(sess.get("step") or 0)
+                if user_id and sess and not sess.get("messaging_user_id"):
+                    sess["messaging_user_id"] = user_id
+                    save_session(user_id, sess)
+            except Exception as e:
+                logger.warning("onboarding get_session failed: %s %s", e, _log_ctx(shop_id, user_id))
+                sess = {}
+                step = 0
+        low_txt = (text or "").strip().lower()
+        start_keywords = ("เริ่มต้นใช้งาน", "เริ่มต้นเปิดร้านของคุณ")
+        is_admin_start = (oa_ctx == "admin") and any(k in low_txt for k in start_keywords)
+        logger.info("DEBUG owner-flow ctx=%s owner=%s step=%s is_admin_start=%s",
+                    oa_ctx, bool(owner), step, is_admin_start)
+        owner_prompt_msg = None
+
+        if (
+            oa_ctx == "admin"
+            and not owner
+            and is_admin_start
+            and ev_type == "message"
+            and mtype == "text"
+            and not onboarding_handled
+        ):
+            try:
+                sess = get_session(user_id) or {}
+            except Exception as err:
+                logger.warning(
+                    "get_session failed on admin onboarding start: %s %s",
+                    err,
+                    _log_ctx(shop_id=shop_id, user_id=user_id, event_id=event_id, message_id=message_id),
+                )
+                sess = {}
+
+            sess.update({
+                "step": 1,
+                "messaging_user_id": user_id,
+            })
+            try:
+                save_session(user_id, sess)
+            except Exception as err:
+                logger.warning(
+                    "save_session failed on admin onboarding start: %s %s",
+                    err,
+                    _log_ctx(shop_id=shop_id, user_id=user_id, event_id=event_id, message_id=message_id),
+                )
+
+            start_text = (
+                "ยินดีต้อนรับสู่ MIA ค่ะ 🎉\n"
+                "เราจะช่วยเก็บข้อมูลร้านของคุณ 5 ขั้นตอนสั้น ๆ นะคะ\n\n"
+                "ขั้นที่ 1/5: กรุณาพิมพ์ *ชื่อ - นามสกุลผู้ติดต่อ* ของคุณตอบกลับมาได้เลยค่ะ"
+            )
+
+            if TextSendMessage and replyToken:
+                sent = _reply_line(TextSendMessage(text=start_text))
+                if sent:
+                    logger.info(
+                        "admin onboarding start replied %s",
+                        _log_ctx(shop_id=shop_id, user_id=user_id, event_id=event_id, message_id=message_id),
+                    )
+                else:
+                    logger.warning(
+                        "admin onboarding start reply helper failed %s",
+                        _log_ctx(shop_id=shop_id, user_id=user_id, event_id=event_id, message_id=message_id),
+                    )
+            else:
+                logger.warning(
+                    "missing TextSendMessage or replyToken on admin onboarding start %s",
+                    _log_ctx(shop_id=shop_id, user_id=user_id, event_id=event_id, message_id=message_id),
+                )
+
+            onboarding_handled = True
+            continue
+
+        # --- Auto-owner bootstrap via "เริ่มต้นใช้งาน" on consumer OA ---
+        try:
+            t_start = (text or "").strip()
+        except Exception:
+            t_start = ""
+        try:
+            is_admin_start = bool(is_admin_start)
+        except Exception:
+            is_admin_start = False
+
+        if (oa_ctx == "consumer") and (t_start in ("เริ่มต้นใช้งาน", "เริ่มต้น", "start", "Start")) and (not is_admin_start):
                 # 1) Upsert owners/{user_id} เป็น active owner
                 try:
                     add_owner_user(
@@ -1191,16 +1436,17 @@ def line_webhook():
                 # จบเคสนี้เพื่อไม่ให้ไปชน handler อื่นซ้ำ
                 return "ok", 200
 
-            # fire consumer owner-binding prompt เฉพาะเมื่อ webhook มาจาก consumer OA จริงๆ
-            _oc = (settings or {}).get("oa_consumer") or {}
-            _consumer_ids = {
-                str((_oc.get("bot_user_id") or "")).strip(),
-                str((_oc.get("channel_id") or "")).strip(),
-            }
-            _consumer_ids = {x for x in _consumer_ids if x}
-            _dest = (line_oa_id or "").strip()
-            _is_consumer_dest = _dest in _consumer_ids
+        # fire consumer owner-binding prompt เฉพาะเมื่อ webhook มาจาก consumer OA จริงๆ
+        _oc = (settings or {}).get("oa_consumer") or {}
+        _consumer_ids = {
+            str((_oc.get("bot_user_id") or "")).strip(),
+            str((_oc.get("channel_id") or "")).strip(),
+        }
+        _consumer_ids = {x for x in _consumer_ids if x}
+        _dest = (line_oa_id or "").strip()
+        _is_consumer_dest = _dest in _consumer_ids
 
+        if not onboarding_handled:
             logger.info(
                 "owner_prompt gate: is_consumer_dest=%s oa_ctx=%s shop=%s dest=%s",
                 _is_consumer_dest, oa_ctx, shop_id, _dest
@@ -1255,48 +1501,27 @@ def line_webhook():
             if _is_consumer_dest and (oa_ctx == "consumer") and (not owner) and (not is_admin_start):
                 asked_flag = bool((sess or {}).get("_asked_owner_bind"))
                 if (not asked_flag) and (step == 0) and (mtype == "text") and TextSendMessage:
-                    logger.info(
-                        "owner_prompt: firing (oa_ctx=%s, asked_flag=%s, step=%s, mtype=%s, text=%s)",
-                        oa_ctx, asked_flag, step, mtype, (text or "")[:80]
-                    )
-                    prompt_txt = "ยืนยันสิทธิ์เจ้าของร้านเพื่อเริ่มใช้งานได้เลยครับ"
-                    if QuickReply and QuickReplyButton and MessageAction:
-                        qr_items = [
-                            QuickReplyButton(action=MessageAction(label="ยืนยันเป็นเจ้าของร้าน", text="ยืนยันเป็นเจ้าของร้าน")),
-                            QuickReplyButton(action=MessageAction(label="ยกเลิก", text="ยกเลิก")),
-                        ]
-                        owner_prompt_msg = TextSendMessage(text=prompt_txt, quick_reply=QuickReply(items=qr_items))
-                    else:
-                        owner_prompt_msg = TextSendMessage(text=prompt_txt)
-                    sess["_asked_owner_bind"] = True
-                    try:
-                        save_session(user_id, sess)
-                    except Exception as e:
-                        logger.warning("save_session owner prompt failed: %s %s", e, _log_ctx(shop_id, user_id))
-            def _reply_line(messages):
-                if not replyToken or not api:
-                    logger.warning("skip reply (LINE client unavailable) %s", _log_ctx(shop_id, user_id, event_id))
-                    return
-                try:
-                    msg_list = messages if isinstance(messages, list) else [messages]
-                    api.reply_message(replyToken, msg_list)
-                except Exception as e:
-                    logger.warning("reply failed: %s %s", e, _log_ctx(shop_id, user_id, event_id, message_id))
+                        logger.info(
+                            "owner_prompt: firing (oa_ctx=%s, asked_flag=%s, step=%s, mtype=%s, text=%s)",
+                            oa_ctx, asked_flag, step, mtype, (text or "")[:80]
+                        )
+                        prompt_txt = "ยืนยันสิทธิ์เจ้าของร้านเพื่อเริ่มใช้งานได้เลยครับ"
+                        if QuickReply and QuickReplyButton and MessageAction:
+                            qr_items = [
+                                QuickReplyButton(action=MessageAction(label="ยืนยันเป็นเจ้าของร้าน", text="ยืนยันเป็นเจ้าของร้าน")),
+                                QuickReplyButton(action=MessageAction(label="ยกเลิก", text="ยกเลิก")),
+                            ]
+                            owner_prompt_msg = TextSendMessage(text=prompt_txt, quick_reply=QuickReply(items=qr_items))
+                        else:
+                            owner_prompt_msg = TextSendMessage(text=prompt_txt)
+                        sess["_asked_owner_bind"] = True
+                        try:
+                            save_session(user_id, sess)
+                        except Exception as e:
+                            logger.warning("save_session owner prompt failed: %s %s", e, _log_ctx(shop_id, user_id))
+                if owner_prompt_msg and not owner:
+                    _reply_line(owner_prompt_msg)
 
-            if owner_prompt_msg and not owner:
-                _reply_line(owner_prompt_msg)
-
-            def _qr_text(msg: str, add_online: bool = False):
-                if not TextSendMessage:
-                    return None
-                if QuickReply and QuickReplyButton and MessageAction:
-                    items = [QuickReplyButton(action=MessageAction(label="ยกเลิก", text="ยกเลิก"))]
-                    if add_online:
-                        items.append(QuickReplyButton(action=MessageAction(label="ร้านออนไลน์", text="ร้านออนไลน์")))
-                    return TextSendMessage(text=msg, quick_reply=QuickReply(items=items))
-                return TextSendMessage(text=msg)
-
-            onboarding_handled = False
             start_keywords = ("เริ่มต้นใช้งาน", "เริ่มต้นเปิดร้านของคุณ")
 
             if not owner and mtype == "text":
@@ -1341,124 +1566,136 @@ def line_webhook():
                         )
                     onboarding_handled = True
 
-                # GATE(admin-onboarding): admin-only
-                if not onboarding_handled and (oa_ctx == "admin") and any(k in low_txt for k in start_keywords):
-                    clear_session(user_id)
-                    sess = {
-                        "step": 1,
-                        "created_at": datetime.now(timezone.utc),
-                        "messaging_user_id": user_id,
-                        "_asked_owner_bind": False,
-                    }
-                    save_session(user_id, sess)
-                    logger.info("onboarding start %s", _log_ctx(shop_id, user_id, event_id, message_id))
-                    msg_obj = _qr_text("ยินดีต้อนรับสู่การเปิดร้านใหม่ครับ! ✨\nขั้นที่ 1/4 ชื่อ-นามสกุลของผู้ติดต่อคือ?")
-                    if msg_obj:
-                        _reply_line(msg_obj)
-                    onboarding_handled = True
-                elif not onboarding_handled and (oa_ctx == "admin") and (low_txt == "ยกเลิก" and step):
+            if (oa_ctx == "admin") and not owner:
+                stripped_text = (text or "").strip()
+
+                if low_txt == "ยกเลิก" and step:
                     clear_session(user_id)
                     logger.info("onboarding cancel %s", _log_ctx(shop_id, user_id, event_id, message_id))
-                    msg_obj = _qr_text("🙅 ยกเลิกขั้นตอนแล้วครับ\nพิมพ์ “เริ่มต้นใช้งาน” เพื่อเริ่มใหม่ได้เลย")
-                    if msg_obj:
-                        _reply_line(msg_obj)
+                    _reply_text_simple("🙅 ยกเลิกขั้นตอนแล้วค่ะ หากต้องการเริ่มใหม่พิมพ์ “เริ่มต้นใช้งาน” ได้เลยนะคะ")
                     onboarding_handled = True
-                elif not onboarding_handled and (oa_ctx == "admin") and (low_txt in ("ยืนยันข้อมูล", "ยืนยัน")):
-                    if sess.get("name") and sess.get("phone") and sess.get("shop"):
+                    continue
+
+                if mtype == "text" and stripped_text == "แก้ไขข้อมูล":
+                    _reply_text_simple("หากต้องการแก้ไขข้อมูล พิมพ์รายละเอียดที่ต้องการเปลี่ยนแปลงในแชทนี้ได้เลยค่ะ ทีม MIA จะช่วยอัปเดตให้ 🙌")
+                    onboarding_handled = True
+                    continue
+
+                if mtype == "text" and low_txt in ("ยืนยันข้อมูล", "ยืนยัน"):
+                    has_payment = bool(sess.get("payment_promptpay") or sess.get("payment_qr_url"))
+                    if sess.get("name") and sess.get("phone") and sess.get("shop") and has_payment:
                         req_id = finalize_request_from_session(user_id)
+                        logger.info("admin onboarding finalize req=%s %s", req_id, _log_ctx(shop_id, user_id, event_id, message_id))
                         if req_id:
-                            logger.info("onboarding finalized req=%s %s", req_id, _log_ctx(shop_id, user_id, event_id, message_id))
-                            summary = [
-                                "✅ ส่งคำขอเปิดร้านเรียบร้อย!",
-                                f"รหัสคำขอ: {req_id}",
-                                f"ชื่อร้าน: {sess.get('shop')}",
-                                f"ผู้ติดต่อ: {sess.get('name')} • {sess.get('phone')}",
-                                "ทีมงานจะติดต่อกลับภายใน 1 วันทำการครับ 🙌",
-                            ]
-                            msg_obj = TextSendMessage(text="\n".join(summary)) if TextSendMessage else None
-                            if msg_obj:
-                                _reply_line(msg_obj)
+                            _reply_text_simple("✅ ส่งคำขอเปิดร้านเรียบร้อยแล้วค่ะ! ทีมงาน MIA จะติดต่อกลับภายใน 1 วันทำการ 🙌")
                             clear_session(user_id)
                         else:
-                            msg_obj = _qr_text("ข้อมูลยังไม่ครบครับ ลองตรวจสอบและยืนยันอีกครั้งนะครับ", add_online=True)
-                        if msg_obj:
-                            _reply_line(msg_obj)
+                            _reply_text_simple("ตอนนี้ยังเก็บข้อมูลไม่ครบค่ะ รบกวนลองเริ่มใหม่อีกครั้งโดยพิมพ์ “เริ่มต้นใช้งาน” ได้เลยนะคะ")
                     else:
-                        msg_obj = _qr_text("ยังขาดข้อมูลบางอย่างครับ ใส่ชื่อ เบอร์ และชื่อร้านให้ครบก่อนนะครับ", add_online=True)
-                        if msg_obj:
-                            _reply_line(msg_obj)
+                        _reply_text_simple("ตอนนี้ยังเก็บข้อมูลไม่ครบค่ะ รบกวนพิมพ์ “เริ่มต้นใช้งาน” เพื่อเริ่มต้นใหม่อีกครั้งนะคะ")
                     onboarding_handled = True
-                elif not onboarding_handled and (oa_ctx == "admin") and (step == 1 and text):
-                    sess["name"] = text.strip()
+                    continue
+
+                if step == 1 and mtype == "text" and stripped_text and stripped_text not in start_keywords:
+                    sess["name"] = stripped_text
                     sess["step"] = 2
                     save_session(user_id, sess)
-                    msg_obj = _qr_text("เยี่ยมเลย! ขั้นที่ 2/4 กรุณาพิมพ์เบอร์มือถือ (เช่น 0812345678) ครับ")
-                    if msg_obj:
-                        _reply_line(msg_obj)
+                    _reply_text_simple("เยี่ยมเลย! ขั้นที่ 2/5 กรุณาพิมพ์เบอร์มือถือ (เช่น 0812345678) ครับ")
                     onboarding_handled = True
-                elif not onboarding_handled and (oa_ctx == "admin") and (step == 2):
-                    phone = _normalize_phone_th(text)
-                    if phone and len(phone) == 10 and phone.startswith("0"):
+                    continue
+
+                if step == 2 and mtype == "text":
+                    phone = _normalize_phone_th(text) or stripped_text
+                    if phone and len(phone) >= 9:
                         sess["phone"] = phone
                         sess["step"] = 3
                         save_session(user_id, sess)
-                        msg_obj = _qr_text("เรียบร้อยครับ! ขั้นที่ 3/4 ต้องการใช้ชื่อร้านบน LINE OA ว่าอะไรครับ?")
+                        _reply_text_simple("เรียบร้อยครับ! ขั้นที่ 3/5 ต้องการใช้ชื่อร้านบน LINE OA ว่าอะไรครับ?")
                     else:
-                        msg_obj = _qr_text("ขอเป็นเบอร์มือถือ 10 หลักนะครับ เช่น 0812345678", add_online=False)
-                    if msg_obj:
-                        _reply_line(msg_obj)
+                        _reply_text_simple("ขอเป็นเบอร์มือถือ 10 หลักนะครับ เช่น 0812345678")
                     onboarding_handled = True
-                elif not onboarding_handled and (oa_ctx == "admin") and (step == 3 and text):
-                    sess["shop"] = text.strip()
+                    continue
+
+                if step == 3 and mtype == "text" and stripped_text:
+                    sess["shop"] = stripped_text
                     sess["step"] = 4
                     save_session(user_id, sess)
-                    msg_obj = _qr_text("ขั้นสุดท้าย! แชร์ตำแหน่งร้าน หรือพิมพ์ “ร้านออนไลน์” ถ้าไม่มีหน้าร้านครับ", add_online=True)
-                    if msg_obj:
-                        _reply_line(msg_obj)
+                    _reply_text_simple("ขั้นที่ 4/5 แชร์ตำแหน่งร้าน หรือพิมพ์ “ร้านออนไลน์” ถ้าไม่มีหน้าร้านครับ")
                     onboarding_handled = True
-                elif not onboarding_handled and (oa_ctx == "admin") and (step == 4 and low_txt == "ร้านออนไลน์"):
-                    sess["location"] = None
+                    continue
+
+                location_updated = False
+                if step == 4 and mtype == "text" and stripped_text:
+                    if low_txt == "ร้านออนไลน์":
+                        sess["location"] = {"address": "ร้านออนไลน์", "lat": None, "lng": None}
+                    else:
+                        sess["location"] = {"address": stripped_text, "lat": None, "lng": None}
+                    location_updated = True
+                elif step == 4 and mtype == "location":
+                    sess["location"] = {
+                        "title": msg.get("title") or "ตำแหน่งร้าน",
+                        "address": msg.get("address"),
+                        "lat": msg.get("latitude"),
+                        "lng": msg.get("longitude"),
+                    }
+                    location_updated = True
+
+                if location_updated:
                     sess["step"] = 5
                     save_session(user_id, sess)
-                    msg_obj = TextSendMessage(text="รับทราบครับ 🛒 ตรวจสอบข้อมูลอีกครั้ง แล้วพิมพ์ “ยืนยันข้อมูล” เพื่อส่งให้ทีมงานนะครับ") if TextSendMessage else None
-                    if msg_obj:
-                        _reply_line(msg_obj)
+                    _reply_text_simple("รับทราบครับ ✨ ขั้นที่ 5/5 กรุณาส่งช่องทางรับเงินของร้าน สามารถพิมพ์หมายเลข PromptPay/บัญชีธนาคาร หรือส่งรูป QR code ก็ได้เลยครับ")
                     onboarding_handled = True
+                    continue
 
-            if (oa_ctx == "admin") and not owner and mtype == "location" and step == 4:
-                sess["location"] = {
-                    "title": msg.get("title") or "ตำแหน่งร้าน",
-                    "address": msg.get("address"),
-                    "lat": msg.get("latitude"),
-                    "lng": msg.get("longitude")
-                }
-                sess["step"] = 5
-                save_session(user_id, sess)
-                logger.info("onboarding location captured %s", _log_ctx(shop_id, user_id, event_id, message_id))
-                msg_obj = TextSendMessage(text="รับพิกัดแล้วครับ 📍 ตรวจสอบข้อมูลอีกครั้ง แล้วพิมพ์ “ยืนยันข้อมูล” ได้เลย") if TextSendMessage else None
-                if msg_obj:
-                    _reply_line(msg_obj)
-                onboarding_handled = True
+                if step >= 5:
+                    if mtype == "image":
+                        media = _download_line_content(access_token, message_id)
+                        if media:
+                            content, ct = media
+                            url = upload_payment_qr_bytes(user_id, content, ct)
+                            if url:
+                                sess["payment_qr_url"] = url
+                                sess["step"] = 5
+                                save_session(user_id, sess)
+                                logger.info("admin onboarding payment_qr stored %s", _log_ctx(shop_id, user_id, event_id, message_id))
+                                _send_onboarding_summary(sess)
+                            else:
+                                _reply_text_simple("อัปโหลดรูปไม่สำเร็จ ลองใหม่อีกครั้งนะครับ")
+                        else:
+                            _reply_text_simple("ดาวน์โหลดไฟล์ไม่สำเร็จ ลองส่งใหม่อีกครั้งนะครับ")
+                        onboarding_handled = True
+                        continue
 
-            if (oa_ctx == "admin") and not owner and mtype == "image" and step in (1, 2, 3, 4, 5):
-                media = _download_line_content(access_token, message_id)
-                if media:
-                    content, ct = media
-                    url = upload_logo_bytes(user_id, content, ct)
-                    if url:
-                        sess["logo_url"] = url
-                        save_session(user_id, sess)
-                        logger.info("onboarding logo stored %s", _log_ctx(shop_id, user_id, event_id, message_id))
-                        reply_msg = TextSendMessage(text="📸 รับโลโก้เรียบร้อยครับ!") if TextSendMessage else None
-                    else:
-                        logger.warning("onboarding logo upload failed %s", _log_ctx(shop_id, user_id, event_id, message_id))
-                        reply_msg = TextSendMessage(text="อัปโหลดรูปไม่สำเร็จ ลองใหม่อีกครั้งนะครับ") if TextSendMessage else None
-                    if reply_msg:
-                        _reply_line(reply_msg)
-                onboarding_handled = True
+                    if mtype == "text" and stripped_text:
+                        stored_payment = False
+                        lower_payment_text = stripped_text.lower()
+                        if lower_payment_text.startswith(("note", "หมายเหตุ")):
+                            payload = stripped_text.split(":", 1)
+                            note_val = payload[1].strip() if len(payload) > 1 else stripped_text
+                            sess["payment_note"] = note_val or stripped_text
+                            stored_payment = True
+                        elif not sess.get("payment_promptpay"):
+                            sess["payment_promptpay"] = stripped_text
+                            stored_payment = True
+                        else:
+                            sess["payment_note"] = stripped_text
+                            stored_payment = True
 
-            if onboarding_handled:
-                continue
+                        if stored_payment:
+                            sess["step"] = 5
+                            save_session(user_id, sess)
+                            if sess.get("payment_promptpay") or sess.get("payment_qr_url"):
+                                if not _send_onboarding_summary(sess):
+                                    _reply_text_simple("รับข้อมูลช่องทางรับเงินเรียบร้อยแล้วครับ ตรวจสอบและกดปุ่มยืนยันได้เลยนะครับ")
+                            else:
+                                _reply_text_simple("รับทราบหมายเหตุแล้วค่ะ รบกวนส่ง PromptPay หรือ QR code เพิ่มเติมด้วยนะคะ")
+                        else:
+                            _reply_text_simple("กรุณาพิมพ์ช่องทาง PromptPay หรือหมายเหตุเพิ่มเติมนะครับ")
+                        onboarding_handled = True
+                        continue
+
+                if onboarding_handled:
+                    continue
 
             if mtype == "text":
                 if owner:
@@ -1699,8 +1936,9 @@ def line_webhook():
             # ignore other message types for now
             logger.info("skip message type=%s %s", mtype, _log_ctx(shop_id, user_id, event_id, message_id))
 
-        except Exception as e:
-            logger.exception("event processing error: %s %s", e, _log_ctx(shop_id, user_id, event_id, message_id))
+        #except Exception as e:
+            # Ensure exception object is converted to string for formatting
+            #logger.exception("event processing error: %s %s", str(e), _log_ctx(shop_id, user_id, event_id, message_id))
 
     return "OK", 200
 
