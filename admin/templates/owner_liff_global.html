@@ -6,14 +6,15 @@
   <title>Owner Sign-in • LINE OA</title>
   <script src="https://static.line-scdn.net/liff/edge/2/sdk.js"></script>
   <script>
-    const UI_MODE = "addon";
-    const AUTO_START = true;
+    const UI_MODE = "global";
+    const AUTO_START = false;
   </script>
   <style>
     :root{
+      --brand:#008080;
+      --accent:#F97316;
       --bg:#F5F7FB;
       --ink:#111827;
-      --accent:#F97316;
     }
     body{
       margin:0;
@@ -28,36 +29,38 @@
     }
     .page{
       width:100%;
-      max-width:520px;
+      max-width:640px;
       background:#fff;
       border-radius:20px;
-      box-shadow:0 18px 40px rgba(15,23,42,0.15);
+      box-shadow:0 25px 60px rgba(15,23,42,0.12);
       padding:32px 28px;
-      text-align:center;
       display:flex;
       flex-direction:column;
-      gap:18px;
+      gap:24px;
     }
-    .muted{color:#6b7280}
+    .hero{text-align:center}
+    .logo-circle{width:200px;height:180px;display:flex;align-items:center;justify-content:center;margin:0 auto}
+    .logo-img{width:200px;height:auto;display:block}
+    h1{margin:0;font-size:26px}
+    .tagline{margin:12px auto 0;color:#6b7280;line-height:1.6}
+    .highlight{
+      background:#F0FDF4;
+      border:1px solid #BBF7D0;
+      border-radius:16px;
+      padding:18px;
+      color:#14532D;
+    }
+    .highlight ul{margin:12px 0 0 18px;padding:0}
+    .highlight li{margin-bottom:6px}
     .status-card{
       background:#F9FAFB;
       border-radius:14px;
       padding:16px;
       font-size:14px;
       border:1px solid #E5E7EB;
-      text-align:left;
     }
     #err{color:#b91c1c;white-space:pre-wrap;margin:12px 0 0;font-family:inherit}
-    .spinner{
-      width:48px;
-      height:48px;
-      border-radius:50%;
-      border:4px solid rgba(249,115,22,0.2);
-      border-top-color:var(--accent);
-      margin:0 auto 12px;
-      animation:spin 1s linear infinite;
-    }
-    @keyframes spin{to{transform:rotate(360deg);}}
+    .cta{text-align:center}
     .btn{
       border:none;
       border-radius:999px;
@@ -69,22 +72,41 @@
       cursor:pointer;
       transition:transform .15s, box-shadow .15s;
     }
-    .btn:disabled{opacity:.5;cursor:default;box-shadow:none}
+    .btn:disabled{opacity:.5;cursor:default;box-shadow:none !important}
     .btn.active:hover{transform:translateY(-1px);box-shadow:0 12px 24px rgba(249,115,22,.35)}
+    @media(max-width:520px){.page{padding:28px 20px}}
   </style>
 </head>
 <body>
   <div class="page">
-    <div>
-      <div class="spinner"></div>
-      <h1>กำลังเข้าสู่ระบบ…</h1>
-      <p class="muted">โปรดรอสักครู่ ระบบกำลังตรวจสอบสิทธิ์</p>
+    <div class="hero">
+      <div class="logo-circle">
+        <img src="/static/logo.png" alt="MIA logo" class="logo-img">
+      </div>
+      <h1>ยินดีต้อนรับสู่ MIA 🎉</h1>
+      <p class="tagline">
+        ผู้ช่วยอัจฉริยะสำหรับธุรกิจของคุณ<br/>
+        ช่วยดูแลลูกค้า รายงาน และการเติบโตของร้านในที่เดียว
+      </p>
     </div>
+
+    <section class="highlight">
+      <p>จากวันนี้คุณสามารถใช้ MIA เพื่อ</p>
+      <ul>
+        <li>ดูภาพรวมลูกค้าจาก LINE OA ของร้าน</li>
+        <li>ติดตามยอดและกิจกรรมสำคัญของลูกค้า</li>
+        <li>เตรียมเชื่อมต่อ AI เพื่อช่วยตอบแชทและวิเคราะห์ข้อมูลในอนาคต</li>
+      </ul>
+    </section>
+
     <div class="status-card">
       <p id="status-text">กำลังตรวจสอบสิทธิ์เจ้าของร้าน โปรดรอสักครู่…</p>
       <pre id="err"></pre>
     </div>
-    <button id="btn-open-shop" class="btn" disabled>เข้าสู่หน้าร้านของฉัน</button>
+
+    <footer class="cta">
+      <button id="btn-open-shop" class="btn" disabled>เข้าสู่หน้าร้านของฉัน</button>
+    </footer>
   </div>
   <script>
     const LIFF_IDS = {{ (liff_ids|default([]))|tojson }};

@@ -1929,14 +1929,28 @@ def owner_auth_liff_boot():
         )
         return render_template_string("<p>Missing LIFF_ID env</p>"), 500
 
+    base_global = (not next_param) or (next_param.strip() == "") or (next_param.strip() == "/") or (kind == "global")
+    is_global_context = base_global and not (is_report_context or is_promo_context)
+
     logging.getLogger("admin-auth").info(
         "owner_auth_liff_boot context=%s next=%s candidates=%s",
         kind,
         next_param,
         liff_candidates,
     )
-    # สำคัญ: ต้อง return เสมอ ไม่ปล่อยให้ฟังก์ชันจบโดยไม่ return
-    return render_template("owner_liff_boot.html", liff_ids=liff_candidates)
+    if is_global_context:
+        return render_template(
+            "owner_liff_global.html",
+            liff_ids=liff_candidates,
+            next_param=next_param,
+            kind=kind,
+        )
+    return render_template(
+        "owner_liff_boot.html",
+        liff_ids=liff_candidates,
+        next_param=next_param,
+        kind=kind,
+    )
 
 @admin_bp.get('/owner/promotions/form')
 def owner_promo_form_shortcut():

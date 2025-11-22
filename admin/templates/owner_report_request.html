@@ -224,7 +224,9 @@ formEl.addEventListener('submit', async (e) => {
     const jsRun = await resRun.json();
     if(!resRun.ok || !jsRun.ok){ throw new Error(jsRun.error || 'ประมวลผลรายงานไม่สำเร็จ'); }
     // 3) Open result in new tab and refresh list
-    if(jsRun.pdf_url){ window.open(jsRun.pdf_url, '_blank'); }
+    if(jsRun.pdf_url){
+      window.location.href = jsRun.pdf_url;
+     }
     await refreshList();
     formEl.reset();
   } catch (err){
