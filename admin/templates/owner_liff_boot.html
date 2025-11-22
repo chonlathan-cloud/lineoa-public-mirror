@@ -150,7 +150,7 @@
         openBtn.addEventListener("click", cb);
       };
       try{
-        const LIFF_IDS = {{ liff_ids|tojson }};
+        const LIFF_IDS = {{ (liff_ids|default([]))|tojson }};
         if(!Array.isArray(LIFF_IDS) || LIFF_IDS.length === 0){
           throw new Error("missing_liff_id");
         }
@@ -294,7 +294,7 @@
         } else {
           navigate();
         }
-      }catch(e){
+      } catch (e) {
         setStatus("เกิดข้อผิดพลาด กรุณาลองใหม่อีกครั้ง");
         showError("เกิดข้อผิดพลาด: " + (e && e.message ? e.message : e));
       }

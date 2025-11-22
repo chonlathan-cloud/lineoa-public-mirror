@@ -302,8 +302,16 @@ def _line_bot_api_for_shop(shop_id: str, settings: Optional[Dict[str, Any]] | No
         logging.getLogger("admin-invite").warning("line bot init failed shop=%s err=%s", shop_id, e)
         return None
 
-def _build_owner_invite_url(shop_id: str, token: str) -> str:
-    return f"{ADMIN_BASE_URL}/owner/auth/liff/boot?sid={shop_id}&token={token}"
+def _build_owner_invite_url(shop_id: str, token: str, next_path: Optional[str] = None) -> str:
+    """Build owner invite boot URL with optional next path for context-aware LIFF selection."""
+    base = f"{ADMIN_BASE_URL}/owner/auth/liff/boot?sid={shop_id}&token={token}"
+    if next_path:
+        try:
+            from urllib.parse import quote as _quote
+            return f"{base}&next={_quote(next_path, safe='')}"
+        except Exception:
+            return f"{base}&next={next_path}"
+    return base
 
 # --- Helper: build add-friend link for consumer OA using basic_id ---
 def _build_consumer_add_friend_link(settings: Optional[Dict[str, Any]]) -> Optional[str]:
@@ -471,16 +479,20 @@ def _clear_owner_session_cookie(resp) -> None:
     except Exception:
         pass
 
-def _set_owner_global_cookie(resp, owner_user_id: str, shop_id: str = None, global_user_id: str = None, invite_ctx: dict = None) -> None:
+def _set_owner_global_cookie(resp, owner_user_id: str, shop_id: str | None = None, invite_ctx: dict | None = None) -> None:
+    """
+    Attach the global owner cookie and ensure owner_shops mapping exists.
+
+    - owner_user_id: global LIFF 'sub' (used as owner_shops/{owner_user_id})
+    - shop_id: the shop that this owner just logged into via LIFF (if any)
+    - invite_ctx: optional magic-link context, used to resolve local owner user id
+    """
     # Ensure global↔local mapping exists (prevents owner_not_mapped)
     try:
-        _ensure_owner_mapping_after_liff(
-            shop_id,
-            global_user_id,
-            invite_ctx=invite_ctx if 'invite_ctx' in locals() else None
-        )
+        _ensure_owner_mapping_after_liff(shop_id, owner_user_id, invite_ctx=invite_ctx)
     except Exception as _e:
         logging.getLogger("admin-auth").warning("post-liff mapping failed: %s", _e)
+
     if not owner_user_id:
         return
     max_age = OWNER_SESSION_DAYS * 24 * 60 * 60
@@ -1866,18 +1878,29 @@ def create_or_update_product(shop_id):
 # --- Convenience route for form (no shop_id in path, use ?sid=) ---
 
 # --- Convenience route for form (no shop_id in path, use ?sid= or ?token=) ---
-# --- Convenience route for form (no shop_id in path, use ?sid= or ?token=) ---
+# --- Convenience route
 @admin_bp.get("/owner/auth/liff/boot")
 def owner_auth_liff_boot():
+    """
+    Boot LIFF for owner flows.
+
+    We choose LIFF ID based on context:
+    - kind=report or next startswith /owner/reports -> LIFF_ID_REPORT (primary), then fallback to GLOBAL/DEFAULT
+    - kind=promotion or product or next startswith /owner/promotions -> LIFF_ID_PROMOTION (primary), then fallback to GLOBAL/DEFAULT
+    - otherwise -> GLOBAL_LIFF_ID (if set) or LIFF_ID
+    The template receives a non-empty ordered list of candidate IDs.
+    """
     next_param = (request.args.get("next") or "").strip()
     kind = (request.args.get("kind") or "").strip().lower()
 
     liff_id_global = os.getenv("GLOBAL_LIFF_ID", "").strip()
     liff_id_default = os.getenv("LIFF_ID", "").strip()
-    liff_id_report  = os.getenv("LIFF_ID_REPORT", "").strip()
+    liff_id_report = os.getenv("LIFF_ID_REPORT", "").strip()
     liff_id_promotion = os.getenv("LIFF_ID_PROMOTION", "").strip()
 
     def _append(candidate: Optional[str], acc: List[str]) -> None:
+        if candidate:
+            candidate = candidate.strip()
         if candidate and candidate not in acc:
             acc.append(candidate)
 
@@ -1887,25 +1910,32 @@ def owner_auth_liff_boot():
     is_promo_context = (kind in ("promotion", "product")) or next_path.startswith("/owner/promotions")
 
     liff_candidates: List[str] = []
-    _append(liff_id_global, liff_candidates)
+
+    # 1) ใส่ LIFF ตาม context ก่อน
     if is_report_context:
         _append(liff_id_report, liff_candidates)
-        _append(liff_id_default, liff_candidates)
-        _append(liff_id_promotion, liff_candidates)
     elif is_promo_context:
         _append(liff_id_promotion, liff_candidates)
-        _append(liff_id_default, liff_candidates)
-        _append(liff_id_report, liff_candidates)
-    else:
-        _append(liff_id_default, liff_candidates)
-        _append(liff_id_report, liff_candidates)
-        _append(liff_id_promotion, liff_candidates)
+
+    # 2) ตามด้วย global/default เป็น fallback
+    _append(liff_id_global, liff_candidates)
+    _append(liff_id_default, liff_candidates)
 
     if not liff_candidates:
-        logging.getLogger("admin-auth").error("LIFF IDs missing for context kind=%s next=%s", kind, next_param)
+        logging.getLogger("admin-auth").error(
+            "LIFF IDs missing for owner_auth_liff_boot kind=%s next=%s",
+            kind,
+            next_param,
+        )
         return render_template_string("<p>Missing LIFF_ID env</p>"), 500
 
-    logging.getLogger("admin-auth").info("owner_auth_liff_boot context=%s next=%s candidates=%s", kind, next_param, liff_candidates)
+    logging.getLogger("admin-auth").info(
+        "owner_auth_liff_boot context=%s next=%s candidates=%s",
+        kind,
+        next_param,
+        liff_candidates,
+    )
+    # สำคัญ: ต้อง return เสมอ ไม่ปล่อยให้ฟังก์ชันจบโดยไม่ return
     return render_template("owner_liff_boot.html", liff_ids=liff_candidates)
 
 @admin_bp.get('/owner/promotions/form')
@@ -2080,14 +2110,47 @@ def owner_auth_liff_callback():
         except Exception as e:
             logging.getLogger("admin-auth").warning("mark invite used failed: %s", e)
 
-    # 5) Set cookie session and return redirect target
+    # 5) Rosolve redirect target: พยามยามใช้ line oa consumer ก่อน 
+    redirect_url : Optional[str] = None
+
+    if shop_id:
+        settings_for_redirect: Dict[str, Any] = {}
+        #5.1 ใข้ dao helper ถ้ามี 
+        if callable(get_shop_settings):
+            try:
+                data = get_shop_settings(shop_id)
+                if isinstance(data, dict):
+                    settings_for_redirect = data
+            except Exception:
+                settings_for_redirect = {}
+        #5.2 fallback ไปอ่าน firestore shop/{shop_id}/settings/drfault
+        if not settings_for_redirect:
+            try:
+                snap = (
+                    get_db().collection("shops")
+                    .document(shop_id).collection("settings").document("default").get()
+                )
+                if snap.exists:
+                    data = snap.to_dict() or {}
+                    if isinstance(data, dict):
+                        settings_for_redirect = data
+            except Exception:
+                settings_for_redirect
+        #5.3 แปลง setttings > link add friend is counsumner oa
+        try:
+            redirect_url = _build_consumer_add_friend_link(settings_for_redirect)
+        except Exception:
+            redirect_url = None
+    # if not finding Use {behaviour} orditional
+    if not redirect_url:
+        redirect_url = (next_param or "/owner/promotions/form")
     resp = jsonify({
         "ok": True,
         "shop_id": shop_id,
         "needs_shop_selection": needs_selection,
         "redirect": (next_param or "/owner/promotions/form"),
     })
-    _set_owner_global_cookie(resp, owner_user_id)
+    _set_owner_global_cookie(resp, owner_user_id, shop_id=shop_id, invite_ctx=invite_ctx)
     if shop_id:
         _set_owner_session_cookie(resp, shop_id)
     else:
@@ -2118,6 +2181,7 @@ def _verify_line_id_token(raw_id_token: str) -> Optional[dict]:
         log.error("GLOBAL_LINE_LOGIN_CHANNEL_ID is not configured")
         return None
     aud_candidates: List[str] = [global_cid]
+    line_login_cid = os.environ.get("LINE_LOGIN_CHANNEL_ID", "").strip()
 
     # Parse header & unverified claims for diagnostics
     try:
