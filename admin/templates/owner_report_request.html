@@ -40,7 +40,9 @@
   <div id="list"></div>
 </div>
 
+<script src="https://static.line-scdn.net/liff/edge/2/sdk.js"></script>
 <script>
+const LIFF_ID_REPORT = {{ (liff_id_report or "")|tojson }};
 let shopId = "{{ shop_id or '' }}";
 const listEl = document.getElementById("list");
 const formEl = document.getElementById("reqForm");
@@ -59,6 +61,17 @@ const shopSwitcherHint = document.getElementById("shopSwitcherHint");
   startEl.value = toYMD(start);
   endEl.value = toYMD(end);
 })();
+
+async function initLiffForReportPage(){
+  if (!window.liff || !LIFF_ID_REPORT) {
+    return;
+  }
+  try {
+    await liff.init({ liffId: LIFF_ID_REPORT });
+  } catch (err) {
+    console.error("LIFF init failed on report page", err);
+  }
+}
 
 function setFormDisabled(flag){
   try{
@@ -192,16 +205,22 @@ async function refreshList(){
   listEl.innerHTML = "Loading...";
   const res = await fetch(`/owner/${sid}/reports/requests`);
   const js = await res.json();
-  listEl.innerHTML = (js.items||[]).map(x => `
-    <div style="border:1px solid #e5e7eb;border-radius:8px;padding:10px;margin-bottom:8px;background:#fff">
-      <div><div><b>ประเภท:</b> ${x.kind === 'mini' ? 'Full Report (มีกราฟเส้น)' : 
-                                x.kind === 'full' ? 'Mini Report (4 การ์ดตัวเลข)' : (x.kind || '-')}
-      <div><b>ช่วงเวลา:</b> ${x.start_date ? x.start_date.slice(0,10) : "-"} → ${x.end_date ? x.end_date.slice(0,10) : "-"}</div>
-      <div><b>สถานะ:</b> ${x.status}</div>
-      <div class="muted">สร้างเมื่อ: ${x.created_at || "-"}</div>
-      ${x.pdf_url ? `<div><a href="${x.pdf_url}" target="_blank">ดาวน์โหลดรายงาน</a></div>` : ``}
-    </div>
-  `).join("");
+  listEl.innerHTML = (js.items||[]).map(x => {
+    const kindLabel = x.kind === 'mini'
+      ? 'Full Report (มีกราฟเส้น)'
+      : x.kind === 'full'
+        ? 'Mini Report (4 การ์ดตัวเลข)'
+        : (x.kind || '-');
+    return `
+      <div class="report-card">
+        <div><b>ประเภท:</b> ${kindLabel}</div>
+        <div><b>ช่วงเวลา:</b> ${x.start_date ? x.start_date.slice(0,10) : "-"} → ${x.end_date ? x.end_date.slice(0,10) : "-"}</div>
+        <div><b>สถานะ:</b> ${x.status}</div>
+        <div class="muted">สร้างเมื่อ: ${x.created_at || "-"}</div>
+        ${x.pdf_url ? `<div><a href="${x.pdf_url}" target="_blank">ดาวน์โหลดรายงาน</a></div>` : ``}
+      </div>
+    `;
+  }).join("");
 }
 formEl.addEventListener('submit', async (e) => {
   e.preventDefault();
@@ -223,10 +242,16 @@ formEl.addEventListener('submit', async (e) => {
     const resRun = await fetch(`/owner/${sid}/reports/requests/${reqId}/run`, { method: 'POST' });
     const jsRun = await resRun.json();
     if(!resRun.ok || !jsRun.ok){ throw new Error(jsRun.error || 'ประมวลผลรายงานไม่สำเร็จ'); }
-    // 3) Open result in new tab and refresh list
-    if(jsRun.pdf_url){
-      window.location.href = jsRun.pdf_url;
-     }
+    // 3) Open result using LIFF if available to avoid "Load failed" in webview
+    if (jsRun.pdf_url) {
+      if (window.liff && typeof liff.openWindow === "function") {
+        liff.openWindow({ url: jsRun.pdf_url, external: true });
+      } else {
+        // ถ้าไม่มี LIFF object (เปิดผ่าน browser ปกติหรือ webview ทั่วไป)
+        // ให้เปิดเป็นแท็บ/หน้าต่างใหม่แทนการเปลี่ยน location เดิม
+        window.open(jsRun.pdf_url, "_blank");
+      }
+    }
     await refreshList();
     formEl.reset();
   } catch (err){
@@ -238,13 +263,21 @@ formEl.addEventListener('submit', async (e) => {
 
 setFormDisabled(true);
 initShopSelector();
+
 (async function init(){
   try{
+    // Initialize LIFF for this report page (best-effort)
+    await initLiffForReportPage();
+
+    // Ensure we have a shop context
     await ensureShopId();
+
+    // Now enable the form and load existing history
     setFormDisabled(false);
     await refreshList();
   }catch(err){
     if(err && err.code === "shop_not_selected"){
+      // No active shop in session; let the UI hint from initShopSelector() guide the user.
       return;
     }
     console.error("initialization failed", err);
@@ -252,4 +285,41 @@ initShopSelector();
   }
 })();
 </script>
+<script>
+// Intercept clicks on report PDF links and open them via LIFF external browser
+// to avoid LIFF showing "lineoa-...run.app Load failed" overlay.
+document.addEventListener("click", (ev) => {
+  const target = ev.target;
+  if (!target || typeof target.closest !== "function") {
+    return;
+  }
+  const linkEl = target.closest("a");
+  if (!linkEl) {
+    return;
+  }
+  const href = linkEl.getAttribute("href") || "";
+  if (!href) {
+    return;
+  }
+  // ถ้าเป็นลิงก์ไปยังไฟล์รายงานบน GCS ให้เปิดผ่าน LIFF external แทน
+  if (href.startsWith("http") && href.includes("storage.googleapis.com")) {
+    ev.preventDefault();
+    if (window.liff && typeof liff.openWindow === "function") {
+      liff.openWindow({ url: href, external: true });
+    } else {
+      window.open(href, "_blank");
+    }
+  }
+});
+</script>
+<style>
+  /* Prevent nested/overlapping cards */
+  #list .report-card {
+    border: 1px solid #e5e7eb;
+    border-radius: 10px;
+    padding: 12px;
+    margin-bottom: 12px;
+    background: #fff;
+  }
+</style>
 {% endblock %}

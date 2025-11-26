@@ -100,12 +100,12 @@
     </section>
 
     <div class="status-card">
-      <p id="status-text">กำลังตรวจสอบสิทธิ์เจ้าของร้าน โปรดรอสักครู่…</p>
+      <p id="status-text">ตรวจสอบสิทธิ์เจ้าของร้าน เรียบร้อย</p>
       <pre id="err"></pre>
     </div>
 
     <footer class="cta">
-      <button id="btn-open-shop" class="btn" disabled>เข้าสู่หน้าร้านของฉัน</button>
+      <button id="btn-open-shop" class="btn">MIA ยินดีให้บริการครับ</button>
     </footer>
   </div>
   <script>
@@ -247,6 +247,7 @@
           if(sidParam){ query.set("sid", sidParam); }
           if(inviteToken){ query.set("token", inviteToken); }
           const endpoint = query.toString() ? `/owner/auth/liff/callback?${query.toString()}` : "/owner/auth/liff/callback";
+          
           const res = await fetch(endpoint, {
             method: "POST",
             headers: { "Content-Type": "application/json" },
@@ -257,10 +258,20 @@
               invite_token: inviteToken || undefined
             })
           });
+
           if(!res.ok){
             const text = await res.text();
+            // กรณี token จาก LINE หมดอายุ / ใช้ไม่ได้ → ให้ logout + login ใหม่
+            if(text && text.includes("invalid_id_token") && window.liff){
+              try { liff.logout(); } catch(_e){}
+              setStatus("เซสชันหมดอายุ กำลังพาไปหน้าเข้าสู่ระบบ LINE ใหม่…");
+              isProcessing = false;
+              liff.login();
+              return;
+            }
             throw new Error(text || "auth_failed");
           }
+
           const js = await res.json();
           const fallback = nextParam || "/owner/promotions/form";
           const targetUrl = (js && js.redirect) || fallback;

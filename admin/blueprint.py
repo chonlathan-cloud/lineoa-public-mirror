@@ -126,6 +126,7 @@ def _fallback_pdf_stub(shop_id: str, start_dt, end_dt) -> bytes:
 # --- Report storage config (public PDF links) ---
 REPORT_BUCKET = (os.getenv("REPORT_BUCKET") or "lineoa-report-for-owner").strip()
 REPORT_PUBLIC_BASE = (os.getenv("REPORT_PUBLIC_BASE") or "https://storage.googleapis.com/lineoa-report-for-owner").rstrip("/")
+LIFF_ID_REPORT = (os.getenv("LIFF_ID_REPORT") or "").strip()
 
 _storage_client_reports = None
 def _gcs_client_reports():
@@ -1562,6 +1563,7 @@ def owner_report_form(shop_id):
             'owner_report_request.html',
             shop_id=shop_id,
             shop_display_name=display_name,
+            liff_id_report=LIFF_ID_REPORT,
         )
     except TemplateNotFound:
         return render_template_string('''
