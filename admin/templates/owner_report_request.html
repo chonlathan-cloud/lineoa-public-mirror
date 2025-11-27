@@ -242,17 +242,12 @@ formEl.addEventListener('submit', async (e) => {
     const resRun = await fetch(`/owner/${sid}/reports/requests/${reqId}/run`, { method: 'POST' });
     const jsRun = await resRun.json();
     if(!resRun.ok || !jsRun.ok){ throw new Error(jsRun.error || 'ประมวลผลรายงานไม่สำเร็จ'); }
-    // 3) Open result using LIFF if available to avoid "Load failed" in webview
-    if (jsRun.pdf_url) {
-      if (window.liff && typeof liff.openWindow === "function") {
-        liff.openWindow({ url: jsRun.pdf_url, external: true });
-      } else {
-        // ถ้าไม่มี LIFF object (เปิดผ่าน browser ปกติหรือ webview ทั่วไป)
-        // ให้เปิดเป็นแท็บ/หน้าต่างใหม่แทนการเปลี่ยน location เดิม
-        window.open(jsRun.pdf_url, "_blank");
-      }
-    }
+    // 3) Refresh list and let the user click "ดาวน์โหลดรายงาน" themselves
     await refreshList();
+    if (listEl && typeof listEl.scrollIntoView === "function") {
+      listEl.scrollIntoView({ behavior: "smooth", block: "start" });
+    }
+    alert('สร้างรายงานสำเร็จแล้วค่ะ เลื่อนลงไปกดปุ่ม "ดาวน์โหลดรายงาน" ในรายการล่าสุดเพื่อเปิดไฟล์ PDF');
     formEl.reset();
   } catch (err){
     alert(err.message || 'เกิดข้อผิดพลาด');
