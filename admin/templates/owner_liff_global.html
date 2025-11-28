@@ -110,7 +110,6 @@
   </div>
   <script>
     const LIFF_IDS = {{ (liff_ids|default([]))|tojson }};
-    const INVITE_CTX_KEY = "mia_owner_invite_ctx";
     document.addEventListener("DOMContentLoaded", () => {
       const statusEl = document.getElementById("status-text");
       const errorEl = document.getElementById("err");
@@ -209,24 +208,7 @@
             return undefined;
           };
 
-          // Capture invite context (sid/token/next) on first load from consumer OA
-          try{
-            const rawSid = params.get("sid");
-            const rawToken = params.get("token");
-            const rawNext = params.get("next");
-            if(rawSid || rawToken){
-              const ctx = {
-                sid: rawSid || null,
-                token: rawToken || null,
-                next: rawNext || null,
-                from: "consumer",
-                ts: Date.now()
-              };
-              sessionStorage.setItem(INVITE_CTX_KEY, JSON.stringify(ctx));
-            }
-          }catch(_e){
-            // Ignore storage errors
-          }
+          // (invite context sessionStorage logic removed)
 
           const nextValues = params.getAll("next");
           const sidValues = params.getAll("sid");
@@ -241,30 +223,7 @@
           for(const val of liffStateValues){ enqueue(val); }
           for(const val of stateValues){ enqueue(val); } // เพ่ิมบรรทัดนี้
 
-          let inviteCtx = null;
-          try{
-            const rawCtx = sessionStorage.getItem(INVITE_CTX_KEY);
-            if(rawCtx){
-              inviteCtx = JSON.parse(rawCtx);
-            }
-          }catch(_e){
-            inviteCtx = null;
-          }
-
-          if(inviteCtx){
-            if(!sidParam && inviteCtx.sid){
-              sidParam = inviteCtx.sid;
-            }
-            if(!inviteToken && inviteCtx.token){
-              inviteToken = inviteCtx.token;
-            }
-            if(!nextParam && inviteCtx.next){
-              nextParam = inviteCtx.next;
-            }
-          }
-
-          // This flag will be used to decide whether to close the window after success
-          const cameFromConsumer = !!(inviteCtx && inviteCtx.from === "consumer" && inviteCtx.sid);
+          // (invite context/cameFromConsumer logic removed)
 
           while(queue.length){
             const raw = queue.shift();
@@ -323,37 +282,31 @@
             throw new Error(text || "auth_failed");
           }
 
-          const js = await res.json();
-          const fallback = nextParam || "/owner/promotions/form";
-          const targetUrl = (js && js.redirect) || fallback;
+          // We don't need to navigate anywhere else on success; backend has already
+          // bound the owner and consumed the invite. Just confirm to the user and
+          // close the LIFF window so they return to the LINE OA chat.
+          try{
+            // Optionally read JSON in case the backend sends something, but we ignore redirect fields.
+            const js = await res.json();
+            console.log("owner_auth_liff callback success", js);
+          }catch(_e){
+            // If JSON parsing fails, we still treat it as success.
+          }
 
-          // If this LIFF boot came from a consumer OA invite (tracked in sessionStorage),
-          // then after binding the owner we close the LIFF window so the user returns
-          // to the LINE OA consumer chat.
-          if(cameFromConsumer){
-            setStatus("MIA ยืนยันสิทธิ์เจ้าของร้านเรียบร้อยแล้ว กำลังปิดหน้าต่าง…");
-            try{
-              if(window.liff && typeof liff.closeWindow === "function"){
-                liff.closeWindow();
-                try{ sessionStorage.removeItem(INVITE_CTX_KEY); }catch(_e){}
-                return;
-              }
-            }catch(navErr){
-              console.error("LIFF closeWindow failed", navErr);
+          setStatus("MIA ยืนยันสิทธิ์เจ้าของร้านเรียบร้อยแล้ว 🎉 \
+คุณสามารถกดปุ่มปิด (X) ด้านบนเพื่อกลับไปที่แชตร้านของคุณได้เลยครับ");
+
+          try{
+            if(window.liff && typeof liff.closeWindow === "function"){
+              liff.closeWindow();
+              return;
             }
-            const safeUrl = targetUrl || "/";
-            try{ sessionStorage.removeItem(INVITE_CTX_KEY); }catch(_e){}
-            window.location.assign(safeUrl);
-            return;
+          }catch(navErr){
+            console.error("LIFF closeWindow failed", navErr);
           }
 
-          // Default behavior for non-consumer flows (e.g. promotions/report)
-          setStatus("กำลังนำคุณไปยังหน้าร้าน...");
-          if(window.liff && typeof liff.openWindow === "function"){
-            liff.openWindow({ url: targetUrl, external: false });
-          } else {
-            window.location.assign(targetUrl);
-          }
+          // If closeWindow is not available (e.g., opened in a normal browser),
+          // we do NOT force any redirect. The user can manually close the tab/window.
         } catch (e) {
           isProcessing = false;
           setStatus("เกิดข้อผิดพลาด กรุณาลองใหม่อีกครั้ง");

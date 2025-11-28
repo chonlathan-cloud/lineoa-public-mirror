@@ -3,7 +3,6 @@ from datetime import datetime, timezone
 from typing import Optional, Dict, Any
 from google.cloud import storage, firestore
 from firestore_client import get_db
-from urllib.parse import quote
 
 MEDIA_BUCKET = os.getenv("MEDIA_BUCKET")
 MEDIA_PUBLIC_BASE = os.getenv("MEDIA_PUBLIC_BASE")
@@ -141,8 +140,6 @@ def to_flex_summary(session: Dict[str, Any]) -> Dict[str, Any]:
     name = session.get("name") or "-"
     phone = session.get("phone") or "-"
     address = (session.get("location") or {}).get("address") or "ธุรกิจออนไลน์ ไม่มีหน้าร้าน"
-    safe = quote(shop, safe="")
-    logo_url = session.get("logo_url") or f"https://dummyimage.com/600x400/cccccc/000000&text={safe}"
 
     # --- payment summary from session ---
     pay_promptpay = (session.get("payment_promptpay") or "").strip()
@@ -167,13 +164,6 @@ def to_flex_summary(session: Dict[str, Any]) -> Dict[str, Any]:
         "altText": "สรุปข้อมูลร้านค้า",
         "contents": {
             "type": "bubble",
-            "hero": {
-                "type": "image",
-                "url": logo_url,
-                "size": "full",
-                "aspectRatio": "20:13",
-                "aspectMode": "cover",
-            },
             "body": {
                 "type": "box",
                 "layout": "vertical",
