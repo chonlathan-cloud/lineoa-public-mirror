@@ -7,7 +7,7 @@
   <script src="https://static.line-scdn.net/liff/edge/2/sdk.js"></script>
   <script>
     const UI_MODE = "global";
-    const AUTO_START = true;
+    const AUTO_START = false;
   </script>
   <style>
     :root{
@@ -100,7 +100,7 @@
     </section>
 
     <div class="status-card">
-      <p id="status-text">ตรวจสอบสิทธิ์เจ้าของร้าน เรียบร้อย</p>
+      <p id="status-text">กดปุ่มด้านล่างเพื่อยืนยันสิทธิ์และเข้าสู่หน้าร้านของคุณ</p>
       <pre id="err"></pre>
     </div>
 
@@ -110,6 +110,7 @@
   </div>
   <script>
     const LIFF_IDS = {{ (liff_ids|default([]))|tojson }};
+    const INVITE_CTX_KEY = "mia_owner_invite_ctx";
     document.addEventListener("DOMContentLoaded", () => {
       const statusEl = document.getElementById("status-text");
       const errorEl = document.getElementById("err");
@@ -208,16 +209,62 @@
             return undefined;
           };
 
+          // Capture invite context (sid/token/next) on first load from consumer OA
+          try{
+            const rawSid = params.get("sid");
+            const rawToken = params.get("token");
+            const rawNext = params.get("next");
+            if(rawSid || rawToken){
+              const ctx = {
+                sid: rawSid || null,
+                token: rawToken || null,
+                next: rawNext || null,
+                from: "consumer",
+                ts: Date.now()
+              };
+              sessionStorage.setItem(INVITE_CTX_KEY, JSON.stringify(ctx));
+            }
+          }catch(_e){
+            // Ignore storage errors
+          }
+
           const nextValues = params.getAll("next");
           const sidValues = params.getAll("sid");
           const tokenValues = params.getAll("token");
           const liffStateValues = params.getAll("liff.state");
+          const stateValues = params.getAll("state");
 
           let nextParam = coalesceFirst(nextValues);
           let sidParam = coalesceFirst(sidValues);
           let inviteToken = coalesceFirst(tokenValues);
           for(const val of nextValues){ enqueue(val); }
           for(const val of liffStateValues){ enqueue(val); }
+          for(const val of stateValues){ enqueue(val); } // เพ่ิมบรรทัดนี้
+
+          let inviteCtx = null;
+          try{
+            const rawCtx = sessionStorage.getItem(INVITE_CTX_KEY);
+            if(rawCtx){
+              inviteCtx = JSON.parse(rawCtx);
+            }
+          }catch(_e){
+            inviteCtx = null;
+          }
+
+          if(inviteCtx){
+            if(!sidParam && inviteCtx.sid){
+              sidParam = inviteCtx.sid;
+            }
+            if(!inviteToken && inviteCtx.token){
+              inviteToken = inviteCtx.token;
+            }
+            if(!nextParam && inviteCtx.next){
+              nextParam = inviteCtx.next;
+            }
+          }
+
+          // This flag will be used to decide whether to close the window after success
+          const cameFromConsumer = !!(inviteCtx && inviteCtx.from === "consumer" && inviteCtx.sid);
 
           while(queue.length){
             const raw = queue.shift();
@@ -262,9 +309,13 @@
           if(!res.ok){
             const text = await res.text();
             // กรณี token จาก LINE หมดอายุ / ใช้ไม่ได้ → ให้ logout + login ใหม่
-            if(text && text.includes("invalid_id_token") && window.liff){
+            if(text && window.liff && (
+                  text.includes("invalid_id_token") ||
+                  text.includes("Signature has expired") ||
+                  text.includes("id_token_expired")
+                )){
               try { liff.logout(); } catch(_e){}
-              setStatus("เซสชันหมดอายุ กำลังพาไปหน้าเข้าสู่ระบบ LINE ใหม่…");
+              setStatus("เซสชันหมดอายุ กำลังพาคุณไปเข้าสู่ระบบ LINE ใหม่…");
               isProcessing = false;
               liff.login();
               return;
@@ -275,6 +326,28 @@
           const js = await res.json();
           const fallback = nextParam || "/owner/promotions/form";
           const targetUrl = (js && js.redirect) || fallback;
+
+          // If this LIFF boot came from a consumer OA invite (tracked in sessionStorage),
+          // then after binding the owner we close the LIFF window so the user returns
+          // to the LINE OA consumer chat.
+          if(cameFromConsumer){
+            setStatus("MIA ยืนยันสิทธิ์เจ้าของร้านเรียบร้อยแล้ว กำลังปิดหน้าต่าง…");
+            try{
+              if(window.liff && typeof liff.closeWindow === "function"){
+                liff.closeWindow();
+                try{ sessionStorage.removeItem(INVITE_CTX_KEY); }catch(_e){}
+                return;
+              }
+            }catch(navErr){
+              console.error("LIFF closeWindow failed", navErr);
+            }
+            const safeUrl = targetUrl || "/";
+            try{ sessionStorage.removeItem(INVITE_CTX_KEY); }catch(_e){}
+            window.location.assign(safeUrl);
+            return;
+          }
+
+          // Default behavior for non-consumer flows (e.g. promotions/report)
           setStatus("กำลังนำคุณไปยังหน้าร้าน...");
           if(window.liff && typeof liff.openWindow === "function"){
             liff.openWindow({ url: targetUrl, external: false });
@@ -293,15 +366,16 @@
       };
 
       if(openBtn){
-        if(!AUTO_START){
-          openBtn.disabled = false;
-          openBtn.classList.add("active");
-        }
-        openBtn.addEventListener("click", startOwnerLogin);
-      }
+        openBtn.disabled = false;
+        openBtn.classList.add("active");
 
-      if(AUTO_START){
-        startOwnerLogin();
+        openBtn.addEventListener("click", async () => {
+          if(isProcessing){
+            return;
+          }
+
+          await startOwnerLogin();
+        });
       }
     });
   </script>
