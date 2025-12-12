@@ -1562,7 +1562,7 @@ def line_webhook():
 
                 stored_amount = ocr_amt if (ocr_amt is not None) else expected_amt
                 intent_ref.set({
-                    "status": "pending",
+                    "status": "awaiting_owner",
                     "created_at": now_utc,
                     "updated_at": now_utc,
                     "customer_user_id": user_id,
@@ -1625,50 +1625,86 @@ def line_webhook():
             if (oa_ctx == "consumer") and owner and (mtype == "text") and text:
                 # Confirm intent: 1010
                 if low_txt == "1010":
-                    intent_before = None
+                    intent_id_before = None
+                    cid = None
                     try:
-                        intent_before = find_latest_pending_intent(shop_id)
+                        intent_id_before = find_latest_pending_intent(shop_id)
+                        if intent_id_before:
+                            db0 = get_db()
+                            snap0 = (
+                                db0.collection("shops").document(shop_id)
+                                   .collection("payment_intents").document(intent_id_before)
+                                   .get()
+                            )
+                            if snap0.exists:
+                                d0 = snap0.to_dict() or {}
+                                cid = d0.get("customer_user_id")
                     except Exception:
-                        intent_before = None
+                        intent_id_before = None
+                        cid = None
                     payment = None
                     try:
-                        payment = confirm_latest_pending_intent_to_payment(shop_id, user_id)
+                        payment = confirm_latest_pending_intent_to_payment(shop_id)
                     except Exception as e:
                         logger.warning("confirm_latest_pending_intent_to_payment failed: %s %s", e, _log_ctx(shop_id=shop_id, user_id=user_id))
                         payment = None
-                    try:
-                        cid = (intent_before or {}).get("customer_user_id") if isinstance(intent_before, dict) else None
-                        if cid:
+                    # Notify customer only when confirm succeeds
+                    if payment and cid:
+                        try:
                             _push_payment_status_to_customer(
                                 access_token,
                                 cid,
                                 "✅ ร้านยืนยันการชำระเงินเรียบร้อยแล้ว ขอบคุณครับ"
                             )
-                    except Exception:
-                        pass
+                        except Exception:
+                            pass
+
+                    # Reply owner for clarity
+                    if payment:
+                        _reply_text_simple("✅ ยืนยันเรียบร้อยแล้วครับ")
+                    else:
+                        _reply_text_simple("❌ ยืนยันไม่สำเร็จ (ไม่พบรายการรอยืนยัน หรือหมดอายุแล้ว)\nลองส่งสลิปใหม่ หรือพิมพ์ 1010 อีกครั้งครับ")
                 # Reject intent: 0011
                 elif low_txt == "0011":
-                    intent_before = None
+                    intent_id_before = None
+                    cid = None
                     try:
-                        intent_before = find_latest_pending_intent(shop_id)
+                        intent_id_before = find_latest_pending_intent(shop_id)
+                        if intent_id_before:
+                            db0 = get_db()
+                            snap0 = (
+                                db0.collection("shops").document(shop_id)
+                                   .collection("payment_intents").document(intent_id_before)
+                                   .get()
+                            )
+                            if snap0.exists:
+                                d0 = snap0.to_dict() or {}
+                                cid = d0.get("customer_user_id")
                     except Exception:
-                        intent_before = None
+                        intent_id_before = None
+                        cid = None
                     result = None
                     try:
-                        result = reject_latest_pending_intent(shop_id, user_id)
+                        result = reject_latest_pending_intent(shop_id)
                     except Exception as e:
                         logger.warning("reject_latest_pending_intent failed: %s %s", e, _log_ctx(shop_id=shop_id, user_id=user_id))
                         result = None
-                    try:
-                        cid = (intent_before or {}).get("customer_user_id") if isinstance(intent_before, dict) else None
-                        if cid:
+                    # Notify customer only when reject succeeds
+                    if result and cid:
+                        try:
                             _push_payment_status_to_customer(
                                 access_token,
                                 cid,
                                 "⚠️ ร้านยังไม่สามารถยืนยันยอดโอนได้ในตอนนี้ หากโอนแล้วกรุณาตรวจสอบอีกครั้ง หรือส่งสลิปใหม่ครับ"
                             )
-                    except Exception:
-                        pass
+                        except Exception:
+                            pass
+
+                    # Reply owner for clarity
+                    if result:
+                        _reply_text_simple("✅ รับทราบครับ (ปัดตกเรียบร้อย)")
+                    else:
+                        _reply_text_simple("❌ ปัดตกไม่สำเร็จ (ไม่พบรายการรอยืนยัน หรือหมดอายุแล้ว)\nลองส่ง 0011 ใหม่อีกครั้งครับ")
         except Exception as _owner_confirm_err:
             logger.warning("owner confirm/reject handler failed: %s %s", _owner_confirm_err, _log_ctx(shop_id=shop_id, user_id=user_id))
         sess: Dict[str, Any] = {}

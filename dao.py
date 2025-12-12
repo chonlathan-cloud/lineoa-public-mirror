@@ -954,7 +954,12 @@ def find_latest_pending_intent(shop_id: str, within_minutes: int = 120) -> Optio
     db = get_db()
     col = db.collection("shops").document(shop_id).collection("payment_intents")
     from datetime import datetime as _dt, timezone as _tz, timedelta as _td
-    since = _dt.now(_tz.utc) - _td(minutes=within_minutes)
+    try:
+        window_minutes = int(float(within_minutes))
+    except Exception:
+        window_minutes = 120
+    window_minutes = max(0, window_minutes)
+    since = _dt.now(_tz.utc) - _td(minutes=window_minutes)
     # Avoid composite index by not combining where(status) + order_by(created_at)
     # Read recent docs by created_at and filter in memory.
     try:
@@ -1039,7 +1044,12 @@ def attach_recent_intent_by_user(
         return None
     db = get_db()
     from datetime import datetime as _dt, timezone as _tz, timedelta as _td
-    since = _dt.now(_tz.utc) - _td(minutes=within_minutes)
+    try:
+        window_minutes = int(float(within_minutes))
+    except Exception:
+        window_minutes = 30
+    window_minutes = max(0, window_minutes)
+    since = _dt.now(_tz.utc) - _td(minutes=window_minutes)
     col = db.collection("shops").document(shop_id).collection("payment_intents")
 
     # Prefer narrowing by customer_user_id alone (single equality), then sort client-side
