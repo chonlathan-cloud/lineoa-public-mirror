@@ -83,7 +83,7 @@ from dao import (
     confirm_payment_by_code, reject_payment_by_code,
     create_payment_intent, set_intent_confirm_code, 
     find_pending_intent_by_code, confirm_intent_to_payment, reject_intent_by_code,
-    find_latest_intent_by_status, find_latest_pending_intent, confirm_latest_pending_intent_to_payment, reject_latest_pending_intent, attach_recent_intent_by_user,
+    find_latest_intent_by_status, find_latest_pending_intent, confirm_latest_pending_intent_to_payment, reject_latest_pending_intent, attach_recent_intent_by_user, update_latest_intent_amount,
     find_recent_pending_magic_link, bind_owner, mark_magic_link_used,
 )
 try:
@@ -294,6 +294,98 @@ def _ocr_slip_amount(content_bytes: bytes) -> Dict[str, Any]:
         logger.warning("ocr_slip_amount failed: %s", e)
         return {"amount": None, "confidence": None, "status": "error", "text_sample": ""}
 
+
+def _gemini_extract_amount_from_slip(public_url: str) -> Dict[str, Any]:
+    """Use Vertex AI Gemini multimodal to extract transfer amount from slip URL."""
+    if not public_url:
+        return {"amount": None, "currency": "THB", "confidence": None, "reason": "ไม่มีลิงก์สลิป", "status": "error"}
+    try:
+        from google.auth import default as google_auth_default  # type: ignore
+        from vertexai import init as vertex_init  # type: ignore
+        from vertexai.generative_models import GenerativeModel, Part, GenerationConfig  # type: ignore
+    except Exception as e:
+        logger.warning("gemini import failed: %s", e)
+        return {"amount": None, "currency": "THB", "confidence": None, "reason": "ใช้งาน Gemini ไม่ได้", "status": "error"}
+
+    model_name = os.environ.get("VERTEX_MODEL", "gemini-2.5-flash")
+    location = os.environ.get("VERTEX_LOCATION", "asia-southeast1")
+    project = os.environ.get("GOOGLE_CLOUD_PROJECT") or os.environ.get("GCLOUD_PROJECT")
+    if not project:
+        try:
+            _, project = google_auth_default()
+        except Exception:
+            project = None
+
+    prompt = (
+        "You are given a payment slip image. Extract ONLY the transfer amount actually paid.\n"
+        "- Ignore account numbers, reference numbers, transaction IDs, phone numbers, QR payloads, timestamps, dates, and fees.\n"
+        "- Return JSON only with keys: amount, currency, confidence, reason.\n"
+        "- currency must be THB. amount must be a number. If uncertain, set amount to null and confidence below 0.6.\n"
+        "- Do not include any text besides the JSON."
+    )
+
+    try:
+        vertex_init(project=project, location=location)
+        model = GenerativeModel(model_name)
+
+        # Vertex AI SDK uses Part.from_uri for remote content.
+        # Best-effort mime type from URL extension.
+        mime_type = "image/jpeg"
+        try:
+            low_url = (public_url or "").lower()
+            if low_url.endswith(".png"):
+                mime_type = "image/png"
+            elif low_url.endswith(".webp"):
+                mime_type = "image/webp"
+        except Exception:
+            pass
+
+        image_part = Part.from_uri(public_url, mime_type=mime_type)
+        resp = model.generate_content(
+            [prompt, image_part],
+            generation_config=GenerationConfig(
+                temperature=0.1,
+                response_mime_type="application/json",
+            ),
+        )
+        txt = getattr(resp, "text", None) or ""
+        parsed = {}
+        try:
+            parsed = json.loads(txt.strip())
+        except Exception:
+            parsed = {}
+        amt = parsed.get("amount")
+        try:
+            amt = float(amt)
+        except Exception:
+            amt = None
+        conf = parsed.get("confidence")
+        try:
+            conf = float(conf)
+        except Exception:
+            conf = None
+        if conf is not None:
+            conf = max(0.0, min(1.0, conf))
+        currency = parsed.get("currency") or "THB"
+        reason = parsed.get("reason") or ""
+        if not reason:
+            reason = "ผลจาก AI"
+        status = "ok" if amt is not None else "no_amount"
+        if conf is not None and conf < 0.6:
+            status = "no_amount"
+        return {
+            "amount": amt,
+            "currency": currency,
+            "confidence": conf,
+            "reason": reason,
+            "status": status,
+            "model": model_name,
+        }
+    except Exception as e:
+        logger.warning("gemini extract failed: %s %s", e, _log_ctx())
+        return {"amount": None, "currency": "THB", "confidence": None, "reason": "ประมวลผลสลิปไม่สำเร็จ", "status": "error"}
+
+
 def _get_shop_pending_quote(shop_id: str) -> Optional[Dict[str, Any]]:
     if not shop_id:
         return None
@@ -342,9 +434,17 @@ def _set_shop_pending_quote(shop_id: str, owner_user_id: str, expected_amount: f
     except Exception as e:
         logger.warning("set_shop_pending_quote failed: %s %s", e, _log_ctx(shop_id=shop_id, user_id=owner_user_id))
 
-def _push_slip_review_to_owners(shop_id: str, access_token: Optional[str], customer_user_id: str,
-                               slip_gcs_uri: Optional[str], show_amount: bool,
-                               amount: Optional[float], currency: str) -> None:
+def _push_slip_review_to_owners(
+    shop_id: str,
+    access_token: Optional[str],
+    customer_user_id: str,
+    slip_gcs_uri: Optional[str],
+    slip_public_url: Optional[str],
+    ai_amount: Optional[float],
+    ai_confidence: Optional[float],
+    ai_reason: Optional[str],
+    currency: str,
+) -> None:
     if not access_token or not LineBotApi or not TextSendMessage:
         return
     try:
@@ -353,17 +453,24 @@ def _push_slip_review_to_owners(shop_id: str, access_token: Optional[str], custo
         if not owners:
             return
 
-        amount_known = show_amount and isinstance(amount, (int, float))
+        amount_known = (ai_amount is not None) and (ai_confidence is not None) and (ai_confidence >= 0.75)
+        high_conf = amount_known and ai_confidence is not None and ai_confidence >= 0.9
+
         if amount_known:
-            amt_txt = f"{float(amount):.2f} {currency}"
-            header = f"มีการแจ้งโอนจากลูกค้า\nยอด: {amt_txt}"
+            amt_txt = f"{float(ai_amount):.2f} {currency}"
+            if high_conf:
+                header = f"AI อ่านได้: {amt_txt} (มั่นใจสูง)"
+            else:
+                header = f"AI คาดว่า: {amt_txt} (มั่นใจปานกลาง) กรุณาเปิดสลิปตรวจสอบ"
         else:
-            header = "มีการแจ้งโอนจากลูกค้า\nกรุณาตรวจสอบสลิป แล้วพิมพ์ \"ยอด 100\" หรือ \"ยอด=100\""
+            header = "กรุณาตรวจสอบสลิป แล้วกด 2020 และพิมพ์ \"ยอด 500\""
 
         # Prefer a public HTTPS URL for better UX (owners can tap-open)
         slip_url = None
         try:
-            if slip_gcs_uri and isinstance(slip_gcs_uri, str):
+            if slip_public_url:
+                slip_url = slip_public_url
+            if (not slip_url) and slip_gcs_uri and isinstance(slip_gcs_uri, str):
                 s = slip_gcs_uri.strip()
                 if s.startswith("gs://") and MEDIA_PUBLIC_BASE and MEDIA_BUCKET:
                     prefix = f"gs://{MEDIA_BUCKET}/"
@@ -373,19 +480,31 @@ def _push_slip_review_to_owners(shop_id: str, access_token: Optional[str], custo
                 if not slip_url:
                     slip_url = s
         except Exception:
-            slip_url = slip_gcs_uri
+            slip_url = slip_public_url or slip_gcs_uri
 
         slip_txt = f"\nสลิป: {slip_url}" if slip_url else ""
-        msg = f"{header}{slip_txt}\nยืนยัน: 1010\nปัดตก: 0011"
+        action_txt = "ยืนยัน: 1010\nปัดตก: 0011\nใส่มือ: 2020"
+        if not amount_known:
+            action_txt = "ใส่มือ: 2020\nปัดตก: 0011"
+        msg = f"{header}{slip_txt}\n{action_txt}"
 
         for oid in owners:
             try:
                 qr = None
                 if QuickReply and QuickReplyButton and MessageAction:
-                    qr = QuickReply(items=[
-                        QuickReplyButton(action=MessageAction(label="ยืนยัน", text="1010")),
-                        QuickReplyButton(action=MessageAction(label="ปัดตก", text="0011")),
-                    ])
+                    items = []
+                    if amount_known:
+                        items.extend([
+                            QuickReplyButton(action=MessageAction(label="ยืนยัน", text="1010")),
+                            QuickReplyButton(action=MessageAction(label="ปัดตก", text="0011")),
+                            QuickReplyButton(action=MessageAction(label="ใส่มือ", text="2020")),
+                        ])
+                    else:
+                        items.extend([
+                            QuickReplyButton(action=MessageAction(label="ใส่มือ", text="2020")),
+                            QuickReplyButton(action=MessageAction(label="ปัดตก", text="0011")),
+                        ])
+                    qr = QuickReply(items=items)
                 api.push_message(oid, TextSendMessage(text=msg, quick_reply=qr))
             except Exception as e:
                 logger.warning("push slip review to owner failed: %s %s uid=%s", e, _log_ctx(shop_id=shop_id), oid)
@@ -1522,6 +1641,17 @@ def line_webhook():
 
                 stored = _store_media(shop_id, "image", message_id, content, ct) if content else None
                 slip_gcs_uri = (stored or {}).get("gcs_uri") if isinstance(stored, dict) else None
+                slip_public_url = (stored or {}).get("public_url") if isinstance(stored, dict) else None
+
+                if not slip_public_url and slip_gcs_uri and isinstance(slip_gcs_uri, str):
+                    s = slip_gcs_uri.strip()
+                    if s.startswith("gs://") and MEDIA_PUBLIC_BASE and MEDIA_BUCKET:
+                        prefix = f"gs://{MEDIA_BUCKET}/"
+                        if s.startswith(prefix):
+                            path = s[len(prefix):]
+                            slip_public_url = f"{MEDIA_PUBLIC_BASE}/{path}"
+                    elif s.startswith("http"):
+                        slip_public_url = s
 
                 pending = _get_shop_pending_quote(shop_id)
                 expected_amt = None
@@ -1530,34 +1660,36 @@ def line_webhook():
                     expected_amt = float(pending.get("expected_amount"))
                     expected_cur = pending.get("currency") or "THB"
 
-                # Always attempt OCR when we have image bytes
-                ocr = {"amount": None, "confidence": None, "status": "skipped", "text_sample": ""}
-                if content:
-                    ocr = _ocr_slip_amount(content)
-
-                ocr_amt = None
-                if isinstance(ocr, dict):
-                    try:
-                        raw_amt = ocr.get("amount")
-                        ocr_amt = float(raw_amt) if raw_amt is not None else None
-                    except Exception:
-                        ocr_amt = None
+                # Run Gemini multimodal extraction (fallback-safe)
+                ai_res = _gemini_extract_amount_from_slip(slip_public_url) if slip_public_url else {"amount": None, "confidence": None, "reason": "no_url", "status": "error"}
+                ai_amt = None
+                ai_conf = None
+                ai_reason = None
+                ai_model = ai_res.get("model") or os.environ.get("VERTEX_MODEL", "gemini-2.5-flash")
+                try:
+                    if isinstance(ai_res.get("amount"), (int, float)):
+                        ai_amt = float(ai_res.get("amount"))
+                except Exception:
+                    ai_amt = None
+                try:
+                    if ai_res.get("confidence") is not None:
+                        ai_conf = float(ai_res.get("confidence"))
+                except Exception:
+                    ai_conf = None
+                if ai_conf is not None:
+                    ai_conf = max(0.0, min(1.0, ai_conf))
+                ai_reason = ai_res.get("reason")
 
                 match_status = "unknown"
                 delta = None
-                threshold = float(os.environ.get("PAYMENT_OCR_MATCH_THRESHOLD", "1.0") or "1.0")
+                if expected_amt is not None and ai_amt is not None:
+                    delta = abs(ai_amt - expected_amt)
+                    match_status = "match" if delta <= float(os.environ.get("PAYMENT_OCR_MATCH_THRESHOLD", "1.0") or "1.0") else "mismatch"
 
-                if expected_amt is not None and ocr_amt is not None:
-                    delta = abs(ocr_amt - expected_amt)
-                    if delta <= threshold:
-                        match_status = "match"
-                    else:
-                        match_status = "mismatch"
-
-                stored_amount = ocr_amt if (ocr_amt is not None) else expected_amt
+                stored_amount = ai_amt if (ai_amt is not None and ai_conf is not None and ai_conf >= 0.75) else None
                 intent_status = "awaiting_owner_confirm" if stored_amount is not None else "awaiting_owner_amount"
-                show_amount = isinstance(stored_amount, (int, float))
-                amount_source = "ocr" if ocr_amt is not None else "unknown"
+                show_amount = stored_amount is not None
+                amount_source = "ai" if stored_amount is not None else "unknown"
 
                 # Create payment_intent directly (so existing 1010/0011 flow works)
                 db = get_db()
@@ -1575,10 +1707,16 @@ def line_webhook():
                     "amount_source": amount_source,
                     "source": "slip_ocr",
                     "slip_gcs_uri": slip_gcs_uri,
+                    "slip_public_url": slip_public_url,
                     "expected_amount": expected_amt,
-                    "ocr_amount": ocr_amt,
-                    "ocr_confidence": ocr.get("confidence") if isinstance(ocr, dict) else None,
-                    "ocr_status": ocr.get("status") if isinstance(ocr, dict) else None,
+                    "ai_amount": ai_amt,
+                    "ai_confidence": ai_conf,
+                    "ai_reason": ai_reason,
+                    "ai_model": ai_model,
+                    "ai_status": ai_res.get("status"),
+                    "ocr_amount": None,
+                    "ocr_confidence": None,
+                    "ocr_status": ai_res.get("status"),
                     "match_status": match_status,
                     "match_delta": delta,
                 }
@@ -1590,8 +1728,10 @@ def line_webhook():
                     access_token,
                     customer_user_id=user_id,
                     slip_gcs_uri=slip_gcs_uri,
-                    show_amount=show_amount,
-                    amount=(stored_amount if show_amount else None),
+                    slip_public_url=slip_public_url,
+                    ai_amount=ai_amt,
+                    ai_confidence=ai_conf,
+                    ai_reason=ai_reason,
                     currency=(expected_cur or "THB"),
                 )
 
@@ -1607,17 +1747,15 @@ def line_webhook():
                 except Exception as _ack_err:
                     logger.warning("slip ack failed: %s %s", _ack_err, _log_ctx(shop_id=shop_id, user_id=user_id))
 
-                ocr_status = ocr.get("status") if isinstance(ocr, dict) else None
-                text_sample = (ocr.get("text_sample") or "") if isinstance(ocr, dict) else ""
-                ocr_conf = ocr.get("confidence") if isinstance(ocr, dict) else None
+                ocr_status = ai_res.get("status") if isinstance(ai_res, dict) else None
+                text_sample = ""
+                ocr_conf = ai_conf
                 logger.info(
-                    "slip intent created intent=%s status=%s ocr_status=%s ocr_amount=%s conf=%s text_len=%s %s",
+                    "slip intent created intent=%s status=%s ai_amount=%s ai_confidence=%s %s",
                     intent_id,
                     intent_status,
-                    ocr_status,
-                    ocr_amt,
-                    ocr_conf,
-                    len(text_sample),
+                    ai_amt,
+                    ai_conf,
                     _log_ctx(shop_id=shop_id, user_id=user_id),
                 )
         except Exception as _se:
@@ -2059,8 +2197,30 @@ def line_webhook():
                             owner_window_min = 120
                         owner_window_min = max(0, owner_window_min)
 
+                        # --- Owner manual override request (2020) ---
+                        if oa_ctx == "consumer" and low_compact == "2020":
+                            iid_manual_req = find_latest_intent_by_status(
+                                shop_id,
+                                statuses=["awaiting_owner_confirm", "awaiting_owner_amount", "awaiting_owner"],
+                                within_minutes=owner_window_min,
+                            )
+                            if iid_manual_req:
+                                try:
+                                    db = get_db()
+                                    db.collection("shops").document(shop_id).collection("payment_intents").document(iid_manual_req).set({
+                                        "status": "awaiting_owner_amount",
+                                        "updated_at": datetime.now(timezone.utc),
+                                    }, merge=True)
+                                except Exception as _pe:
+                                    logger.warning("mark awaiting_owner_amount failed: %s %s", _pe, _log_ctx(shop_id, user_id, event_id, message_id))
+                                _reply_text_simple("โปรดพิมพ์ยอดในรูปแบบ: ยอด 500")
+                                logger.info("owner requested manual amount (2020) iid=%s %s", iid_manual_req, _log_ctx(shop_id, user_id, event_id, message_id))
+                            else:
+                                _reply_text_simple("⚠️ ไม่พบสลิปล่าสุดที่รอยืนยัน")
+                            continue
+
                         # --- Owner manual amount command (strict patterns) ---
-                        manual_amt = None
+                        manual_amt = None 
                         if oa_ctx == "consumer":
                             m_manual = re.match(r"^ยอด\s*(?:=|\s)\s*([0-9][0-9,]*(?:\.\d{1,2})?)\s*(?:บาท)?$", low_compact)
                             if m_manual:
@@ -2071,42 +2231,23 @@ def line_webhook():
                         if oa_ctx == "consumer" and manual_amt is not None and manual_amt > 0:
                             iid_manual = None
                             try:
-                                iid_manual = find_latest_intent_by_status(
-                                    shop_id,
-                                    statuses=["awaiting_owner_amount", "awaiting_owner"],
-                                    within_minutes=owner_window_min,
-                                )
+                                iid_manual = update_latest_intent_amount(shop_id, manual_amt, within_minutes=owner_window_min)
                             except Exception as _me:
-                                logger.warning("find latest awaiting_owner_amount failed: %s %s", _me, _log_ctx(shop_id, user_id, event_id, message_id))
+                                logger.warning("update_latest_intent_amount failed: %s %s", _me, _log_ctx(shop_id, user_id, event_id, message_id))
                                 iid_manual = None
                             if not iid_manual:
                                 _reply_text_simple(f"⚠️ ไม่พบสลิปที่รอระบุยอดในช่วง {owner_window_min} นาทีที่ผ่านมา\nกรุณาส่งสลิปใหม่ครับ")
                                 continue
-                            try:
-                                db = get_db()
-                                snap_manual = db.collection("shops").document(shop_id).collection("payment_intents").document(iid_manual).get()
-                                existing = snap_manual.to_dict() if snap_manual.exists else {}
-                                if isinstance(existing.get("amount"), (int, float)):
-                                    _reply_text_simple("⚠️ รายการล่าสุดมีจำนวนเงินแล้ว พิมพ์ 1010 เพื่อยืนยัน หรือ 0011 เพื่อปัดตก")
-                                    continue
-                                db.collection("shops").document(shop_id).collection("payment_intents").document(iid_manual).set({
-                                    "amount": float(manual_amt),
-                                    "amount_source": "owner_manual",
-                                    "status": "awaiting_owner_confirm",
-                                    "updated_at": datetime.now(timezone.utc),
-                                }, merge=True)
-                                ack_msg = f"✅ Received amount: {float(manual_amt):.2f} THB. Now reply 1010 to confirm or 0011 to reject."
-                                if TextSendMessage and QuickReply and QuickReplyButton and MessageAction:
-                                    qr_ack = QuickReply(items=[
-                                        QuickReplyButton(action=MessageAction(label="ยืนยัน 1010", text="1010")),
-                                        QuickReplyButton(action=MessageAction(label="ปัดตก 0011", text="0011")),
-                                    ])
-                                    _reply_line(TextSendMessage(text=ack_msg, quick_reply=qr_ack))
-                                else:
-                                    _reply_text_simple(ack_msg)
-                                logger.info("owner set manual amount iid=%s amount=%.2f %s", iid_manual, float(manual_amt), _log_ctx(shop_id, user_id, event_id, message_id))
-                            except Exception as _me:
-                                logger.warning("set manual amount failed: %s %s", _me, _log_ctx(shop_id, user_id, event_id, message_id))
+                            ack_msg = f"✅ รับยอด {float(manual_amt):.2f} บาทแล้ว พิมพ์ 1010 เพื่อยืนยัน หรือ 0011 เพื่อปัดตก"
+                            if TextSendMessage and QuickReply and QuickReplyButton and MessageAction:
+                                qr_ack = QuickReply(items=[
+                                    QuickReplyButton(action=MessageAction(label="ยืนยัน 1010", text="1010")),
+                                    QuickReplyButton(action=MessageAction(label="ปัดตก 0011", text="0011")),
+                                ])
+                                _reply_line(TextSendMessage(text=ack_msg, quick_reply=qr_ack))
+                            else:
+                                _reply_text_simple(ack_msg)
+                            logger.info("owner set manual amount iid=%s amount=%.2f %s", iid_manual, float(manual_amt), _log_ctx(shop_id, user_id, event_id, message_id))
                             continue
 
                         # --- Reject first ---
@@ -2155,16 +2296,18 @@ def line_webhook():
                                 continue
                             cus = None
                             intent_amount = None
+                            intent_status = None
                             try:
                                 snap = get_db().collection("shops").document(shop_id).collection("payment_intents").document(iid).get()
                                 data = snap.to_dict() or {}
                                 cus = data.get("customer_user_id")
+                                intent_status = data.get("status")
                                 if isinstance(data.get("amount"), (int, float)):
                                     intent_amount = float(data.get("amount"))
                             except Exception:
                                 intent_amount = None
-                            if intent_amount is None:
-                                _reply_text_simple("⚠️ No amount detected. Please type: ยอด 100")
+                            if (intent_status == "awaiting_owner_amount") or (intent_amount is None):
+                                _reply_text_simple("⚠️ ยังไม่มีจำนวนเงิน กรุณากด 2020 แล้วพิมพ์ 'ยอด 500'")
                                 continue
 
                             pid = confirm_latest_pending_intent_to_payment(shop_id, within_minutes=owner_window_min)
@@ -2340,9 +2483,10 @@ def line_webhook():
             # ignore other message types for now
             logger.info("skip message type=%s %s", mtype, _log_ctx(shop_id, user_id, event_id, message_id))
 
-        #except Exception as e:
+        except Exception as e:
             # Ensure exception object is converted to string for formatting
-            #logger.exception("event processing error: %s %s", str(e), _log_ctx(shop_id, user_id, event_id, message_id))
+            logger.exception("event processing error: %s %s", str(e), _log_ctx(shop_id, user_id, event_id, message_id))
+            continue
 
     return "OK", 200
 

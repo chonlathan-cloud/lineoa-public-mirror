@@ -988,7 +988,7 @@ def find_latest_intent_by_status(shop_id: str, statuses: Any, within_minutes: in
     status_allowed = set(status_list)
 
     window_minutes = _coerce_minutes(within_minutes, 120)
-    since = _dt.now(_tz.utc) - _td(minutes=window_minutes)
+    since = _ensure_aware_utc(_dt.now(_tz.utc)) - _td(minutes=window_minutes)
 
     try:
         docs = list(col.order_by("created_at", direction=firestore.Query.DESCENDING).limit(50).stream())
@@ -1009,9 +1009,9 @@ def find_latest_intent_by_status(shop_id: str, statuses: Any, within_minutes: in
         try:
             # Firestore Timestamp -> datetime
             if hasattr(cat, "to_datetime"):
-                cat_dt = cat.to_datetime()
+                cat_dt = _ensure_aware_utc(cat.to_datetime())
             elif hasattr(cat, "isoformat"):
-                cat_dt = cat
+                cat_dt = _ensure_aware_utc(cat)
             else:
                 cat_dt = None
         except Exception:
@@ -1080,6 +1080,35 @@ def reject_latest_pending_intent(shop_id: str, within_minutes: int = 120) -> Opt
         return None
     iref = db.collection("shops").document(shop_id).collection("payment_intents").document(iid)
     iref.set({"status": "rejected", "rejected_at": ts_now()}, merge=True)
+    return iid
+
+
+def update_latest_intent_amount(shop_id: str, amount: float, within_minutes: int = 120) -> Optional[str]:
+    """Apply manual amount to the latest awaiting_owner_amount intent and move it to awaiting_owner_confirm."""
+    try:
+        amount_f = float(amount)
+    except Exception:
+        return None
+    if amount_f <= 0:
+        return None
+    db = get_db()
+    iid = find_latest_intent_by_status(
+        shop_id,
+        statuses=["awaiting_owner_amount"],
+        within_minutes=within_minutes,
+    )
+    if not iid:
+        return None
+    ref = db.collection("shops").document(shop_id).collection("payment_intents").document(iid)
+    ref.set(
+        {
+            "amount": amount_f,
+            "amount_source": "owner_manual",
+            "status": "awaiting_owner_confirm",
+            "updated_at": ts_now(),
+        },
+        merge=True,
+    )
     return iid
 
 
