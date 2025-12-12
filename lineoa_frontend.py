@@ -61,6 +61,13 @@ try:
     _STORAGE_AVAILABLE = True
 except Exception:
     _STORAGE_AVAILABLE = False
+# optional vision OCR (for slip amont extraction)
+try:
+    from google.cloud import vision
+    _VISION_AVAILABLE = True
+except Exception:
+    vision = None
+    _VISION_AVAILABLE = False
 from flask import Flask, request, abort, jsonify
 from flask_cors import CORS
 from dao import (
@@ -190,6 +197,184 @@ def _get_storage():
     if _storage_client is None:
         _storage_client = storage.Client()
     return _storage_client
+
+# ---------- OCR / Payment Quote Helpers ----------
+
+def _extract_amount_candidates(text: str) -> List[float]:
+    """Return plausible money amounts from free-form text."""
+    if not text:
+        return []
+    t = text.replace(",", "")
+    nums = re.findall(r"\b\d+(?:\.\d{1,2})?\b", t)
+    out: List[float] = []
+    for s in nums:
+        try:
+            v = float(s)
+        except Exception:
+            continue
+        if 1 <= v <= 1000000:
+            out.append(v)
+    return out
+
+def _parse_expected_amount_from_owner_text(text: str) -> Optional[float]:
+    """Parse expected payment amount from owner's message like 'ต้องชำระ 300 บาท'."""
+    if not text:
+        return None
+    low = text.lower()
+    kw = ("ต้องชำระ", "ชำระ", "ชำระเงิน", "โอน", "ยอด", "ยอดรวม", "รวม", "บาท", "฿", "thb")
+    if not any(k in low for k in kw):
+        return None
+    cands = _extract_amount_candidates(text)
+    if not cands:
+        return None
+    try:
+        m = re.search(r"(\d+(?:\.\d{1,2})?)\s*(?:บาท|฿|thb)", low)
+        if m:
+            return float(m.group(1))
+    except Exception:
+        pass
+    return max(cands) if cands else None
+
+def _ocr_slip_amount(content_bytes: bytes) -> Dict[str, Any]:
+    """Run OCR on slip image bytes and try to extract paid amount."""
+    if not content_bytes:
+        return {"amount": None, "confidence": None, "status": "no_bytes", "text_sample": ""}
+    if not _VISION_AVAILABLE or vision is None:
+        return {"amount": None, "confidence": None, "status": "vision_unavailable", "text_sample": ""}
+    try:
+        client = vision.ImageAnnotatorClient()
+        img = vision.Image(content=content_bytes)
+
+        text_all = ""
+        conf = None
+
+        try:
+            resp = client.document_text_detection(image=img) #type : ignore
+            if resp and resp.full_text_annotation and getattr(resp.full_text_annotation, "text", None):
+                text_all = resp.full_text_annotation.text or ""
+            try:
+                pages = getattr(resp.full_text_annotation, "pages", None) or []
+                if pages:
+                    conf = getattr(pages[0], "confidence", None)
+            except Exception:
+                conf = None
+        except Exception:
+            pass
+
+        if not text_all:
+            resp2 = client.text_detection(image=img) #type : ignore
+            if resp2 and resp2.text_annotations:
+                text_all = resp2.text_annotations[0].description or ""
+
+        if not text_all:
+            return {"amount": None, "confidence": conf, "status": "no_text", "text_sample": ""}
+
+        low = (text_all or "").lower()
+
+        keyword_patterns = [
+            r"(?:จำนวนเงิน|ยอดเงิน|ยอดโอน|ยอดชำระ|ยอดสุทธิ|ยอดรวม)\s*[:：]?\s*(\d+(?:\.\d{1,2})?)",
+            r"(?:amount|transfer amount|total)\s*[:：]?\s*(\d+(?:\.\d{1,2})?)",
+        ]
+        for pat in keyword_patterns:
+            try:
+                m = re.search(pat, low)
+                if m:
+                    v = float(m.group(1))
+                    if 1 <= v <= 1000000:
+                        return {"amount": v, "confidence": conf, "status": "ok", "text_sample": (text_all or "")[:500]}
+            except Exception:
+                continue
+
+        cands = _extract_amount_candidates(text_all)
+        if not cands:
+            return {"amount": None, "confidence": conf, "status": "no_amount", "text_sample": (text_all or "")[:500]}
+        v = max(cands)
+        return {"amount": v, "confidence": conf, "status": "ok_fallback", "text_sample": (text_all or "")[:500]}
+    except Exception as e:
+        logger.warning("ocr_slip_amount failed: %s", e)
+        return {"amount": None, "confidence": None, "status": "error", "text_sample": ""}
+
+def _get_shop_pending_quote(shop_id: str) -> Optional[Dict[str, Any]]:
+    if not shop_id:
+        return None
+    try:
+        db = get_db()
+        snap = db.collection("shops").document(shop_id).collection("runtime").document("pending_payment").get()
+        if not snap.exists:
+            return None
+        data = snap.to_dict() or {}
+
+        ttl_min = int(os.environ.get("PAYMENT_QUOTE_TTL_MINUTES", "180") or "180")
+        issued_at = data.get("issued_at")
+        try:
+            if issued_at and hasattr(issued_at, "to_datetime"):
+                issued_dt = issued_at.to_datetime().astimezone(timezone.utc)
+            elif hasattr(issued_at, "astimezone"):
+                issued_dt = issued_at.astimezone(timezone.utc)
+            else:
+                issued_dt = None
+            if issued_dt:
+                age = (datetime.now(timezone.utc) - issued_dt).total_seconds() / 60.0
+                if age > ttl_min:
+                    return None
+        except Exception:
+            pass
+
+        return data
+    except Exception as e:
+        logger.warning("get_shop_pending_quote failed: %s %s", e, _log_ctx(shop_id=shop_id))
+        return None
+
+def _set_shop_pending_quote(shop_id: str, owner_user_id: str, expected_amount: float, source_text: str, currency: str = "THB") -> None:
+    if not (shop_id and owner_user_id and expected_amount):
+        return
+    try:
+        db = get_db()
+        now_utc = datetime.now(timezone.utc)
+        db.collection("shops").document(shop_id).collection("runtime").document("pending_payment").set({
+            "expected_amount": float(expected_amount),
+            "currency": currency,
+            "issued_at": now_utc,
+            "issued_by_owner_user_id": owner_user_id,
+            "source_text": (source_text or "")[:500],
+            "updated_at": now_utc,
+        }, merge=True)
+    except Exception as e:
+        logger.warning("set_shop_pending_quote failed: %s %s", e, _log_ctx(shop_id=shop_id, user_id=owner_user_id))
+
+def _push_slip_review_to_owners(shop_id: str, access_token: Optional[str], customer_user_id: str,
+                               slip_gcs_uri: Optional[str], show_amount: bool,
+                               amount: Optional[float], currency: str) -> None:
+    if not access_token or not LineBotApi or not TextSendMessage:
+        return
+    try:
+        api = LineBotApi(access_token)
+        owners = _resolve_owner_push_targets(shop_id)
+        if not owners:
+            return
+
+        if show_amount and isinstance(amount, (int, float)):
+            amt_txt = f"{float(amount):.2f} {currency}"
+            header = f"มีการแจ้งโอนจากลูกค้า\nยอด: {amt_txt}"
+        else:
+            header = "มีการแจ้งโอนจากลูกค้า\nกรุณาตรวจสอบยอดจากแอปธนาคารของคุณ"
+
+        slip_txt = f"\nสลิป: {slip_gcs_uri}" if slip_gcs_uri else ""
+        msg = f"{header}{slip_txt}\nยืนยัน: 1010\nปัดตก: 0011"
+
+        for oid in owners:
+            try:
+                qr = None
+                if QuickReply and QuickReplyButton and MessageAction:
+                    qr = QuickReply(items=[
+                        QuickReplyButton(action=MessageAction(label="ยืนยัน", text="1010")),
+                        QuickReplyButton(action=MessageAction(label="ปัดตก", text="0011")),
+                    ])
+                api.push_message(oid, TextSendMessage(text=msg, quick_reply=qr))
+            except Exception as e:
+                logger.warning("push slip review to owner failed: %s %s uid=%s", e, _log_ctx(shop_id=shop_id), oid)
+    except Exception as e:
+        logger.warning("push slip review failed: %s %s", e, _log_ctx(shop_id=shop_id, user_id=customer_user_id))
 
 # ---------- Helpers ----------
 
@@ -1300,8 +1485,99 @@ def line_webhook():
         except Exception as e:
             logger.warning("upsert_customer failed %s %s", e, _log_ctx(shop_id, user_id, event_id, message_id))
 
+        # --- Consumer slip OCR flow (customer sends image) ---
+        try:
+            if (oa_ctx == "consumer") and (not owner) and (mtype == "image") and message_id:
+                media = _download_line_content(access_token, message_id)
+                content, ct = (None, None)
+                if media:
+                    content, ct = media
+
+                stored = _store_media(shop_id, "image", message_id, content, ct) if content else None
+                slip_gcs_uri = (stored or {}).get("gcs_uri") if isinstance(stored, dict) else None
+
+                pending = _get_shop_pending_quote(shop_id)
+                expected_amt = None
+                expected_cur = "THB"
+                if pending and isinstance(pending.get("expected_amount"), (int, float)):
+                    expected_amt = float(pending.get("expected_amount"))
+                    expected_cur = pending.get("currency") or "THB"
+
+                # Gate OCR: run only when we have expected amount (reduce cost / false positives)
+                ocr = {"amount": None, "confidence": None, "status": "skipped", "text_sample": ""}
+                if expected_amt is not None and content:
+                    ocr = _ocr_slip_amount(content)
+
+                ocr_amt = ocr.get("amount") if isinstance(ocr, dict) else None
+                try:
+                    ocr_amt = float(ocr_amt) if ocr_amt is not None else None
+                except Exception:
+                    ocr_amt = None
+
+                match_status = "unknown"
+                delta = None
+                show_amount = False
+                threshold = float(os.environ.get("PAYMENT_OCR_MATCH_THRESHOLD", "1.0") or "1.0")
+
+                if expected_amt is not None and ocr_amt is not None:
+                    delta = abs(ocr_amt - expected_amt)
+                    if delta <= threshold:
+                        match_status = "match"
+                        show_amount = True
+                    else:
+                        match_status = "mismatch"
+                        show_amount = False
+
+                # Create payment_intent directly (so existing 1010/0011 flow works)
+                db = get_db()
+                now_utc = datetime.now(timezone.utc)
+                intent_ref = db.collection("shops").document(shop_id).collection("payment_intents").document()
+                intent_id = intent_ref.id
+
+                stored_amount = ocr_amt if (ocr_amt is not None) else expected_amt
+                intent_ref.set({
+                    "status": "pending",
+                    "created_at": now_utc,
+                    "updated_at": now_utc,
+                    "customer_user_id": user_id,
+                    "currency": expected_cur or "THB",
+                    "amount": stored_amount,
+                    "source": "slip_ocr",
+                    "slip_gcs_uri": slip_gcs_uri,
+                    "expected_amount": expected_amt,
+                    "ocr_amount": ocr_amt,
+                    "ocr_confidence": ocr.get("confidence") if isinstance(ocr, dict) else None,
+                    "ocr_status": ocr.get("status") if isinstance(ocr, dict) else None,
+                    "match_status": match_status,
+                    "match_delta": delta,
+                }, merge=True)
+
+                # Notify owners with UX rules:
+                _push_slip_review_to_owners(
+                    shop_id,
+                    access_token,
+                    customer_user_id=user_id,
+                    slip_gcs_uri=slip_gcs_uri,
+                    show_amount=show_amount,
+                    amount=(expected_amt if show_amount else None),
+                    currency=(expected_cur or "THB"),
+                )
+
+                logger.info("slip OCR intent created intent=%s match=%s %s", intent_id, match_status, _log_ctx(shop_id=shop_id, user_id=user_id))
+        except Exception as _se:
+            logger.warning("slip OCR flow failed: %s %s", _se, _log_ctx(shop_id=shop_id, user_id=user_id))
+
         text = (msg.get("text") or "").strip()
         low_txt = text.lower()
+        # --- Owner sets expected payment amount quote (shop-level) ---
+        try:
+            if (oa_ctx == "consumer") and owner and (mtype == "text") and text:
+                exp_amt = _parse_expected_amount_from_owner_text(text)
+                if isinstance(exp_amt, (int, float)) and exp_amt > 0:
+                    _set_shop_pending_quote(shop_id, user_id, float(exp_amt), text, currency="THB")
+                    logger.info("pending quote set by owner amount=%.2f %s", float(exp_amt), _log_ctx(shop_id=shop_id, user_id=user_id))
+        except Exception as _qe:
+            logger.warning("set expected quote failed: %s %s", _qe, _log_ctx(shop_id=shop_id, user_id=user_id))
         sess: Dict[str, Any] = {}
         step = 0
         if not owner:
@@ -1497,32 +1773,6 @@ def line_webhook():
                 except Exception as _oi_err:
                     logger.warning("consumer owner-invite flow failed: %s %s",
                                 _oi_err, _log_ctx(shop_id=shop_id, user_id=user_id))
-
-            if _is_consumer_dest and (oa_ctx == "consumer") and (not owner) and (not is_admin_start):
-                asked_flag = bool((sess or {}).get("_asked_owner_bind"))
-                if (not asked_flag) and (step == 0) and (mtype == "text") and TextSendMessage:
-                        logger.info(
-                            "owner_prompt: firing (oa_ctx=%s, asked_flag=%s, step=%s, mtype=%s, text=%s)",
-                            oa_ctx, asked_flag, step, mtype, (text or "")[:80]
-                        )
-                        prompt_txt = "ยืนยันสิทธิ์เจ้าของร้านเพื่อเริ่มใช้งานได้เลยครับ"
-                        if QuickReply and QuickReplyButton and MessageAction:
-                            qr_items = [
-                                QuickReplyButton(action=MessageAction(label="ยืนยันเป็นเจ้าของร้าน", text="ยืนยันเป็นเจ้าของร้าน")),
-                                QuickReplyButton(action=MessageAction(label="ยกเลิก", text="ยกเลิก")),
-                            ]
-                            owner_prompt_msg = TextSendMessage(text=prompt_txt, quick_reply=QuickReply(items=qr_items))
-                        else:
-                            owner_prompt_msg = TextSendMessage(text=prompt_txt)
-                        sess["_asked_owner_bind"] = True
-                        try:
-                            save_session(user_id, sess)
-                        except Exception as e:
-                            logger.warning("save_session owner prompt failed: %s %s", e, _log_ctx(shop_id, user_id))
-                if owner_prompt_msg and not owner:
-                    _reply_line(owner_prompt_msg)
-
-            start_keywords = ("เริ่มต้นใช้งาน", "เริ่มต้นเปิดร้านของคุณ")
 
             if not owner and mtype == "text":
                 if (oa_ctx == "consumer") and _is_consumer_dest and (low_txt == "ยืนยันเป็นเจ้าของร้าน"):
