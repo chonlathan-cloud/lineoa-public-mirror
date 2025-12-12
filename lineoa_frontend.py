@@ -2483,11 +2483,6 @@ def line_webhook():
             # ignore other message types for now
             logger.info("skip message type=%s %s", mtype, _log_ctx(shop_id, user_id, event_id, message_id))
 
-        except Exception as e:
-            # Ensure exception object is converted to string for formatting
-            logger.exception("event processing error: %s %s", str(e), _log_ctx(shop_id, user_id, event_id, message_id))
-            continue
-
     return "OK", 200
 
 @app.post("/line/webhook/")
