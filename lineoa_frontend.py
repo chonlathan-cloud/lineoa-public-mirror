@@ -359,7 +359,22 @@ def _push_slip_review_to_owners(shop_id: str, access_token: Optional[str], custo
         else:
             header = "มีการแจ้งโอนจากลูกค้า\nกรุณาตรวจสอบยอดจากแอปธนาคารของคุณ"
 
-        slip_txt = f"\nสลิป: {slip_gcs_uri}" if slip_gcs_uri else ""
+        # Prefer a public HTTPS URL for better UX (owners can tap-open)
+        slip_url = slip_gcs_uri
+        try:
+            if slip_url and isinstance(slip_url, str):
+                s = slip_url.strip()
+                # If we got a gs:// URI, convert to public URL when possible
+                if s.startswith("gs://") and MEDIA_PUBLIC_BASE and MEDIA_BUCKET:
+                    prefix = f"gs://{MEDIA_BUCKET}/"
+                    if s.startswith(prefix):
+                        path = s[len(prefix):]
+                        slip_url = f"{MEDIA_PUBLIC_BASE}/{path}"
+                # If we got an http(s) URL already, keep it
+        except Exception:
+            slip_url = slip_gcs_uri
+
+        slip_txt = f"\nสลิป: {slip_url}" if slip_url else ""
         msg = f"{header}{slip_txt}\nยืนยัน: 1010\nปัดตก: 0011"
 
         for oid in owners:
@@ -375,6 +390,17 @@ def _push_slip_review_to_owners(shop_id: str, access_token: Optional[str], custo
                 logger.warning("push slip review to owner failed: %s %s uid=%s", e, _log_ctx(shop_id=shop_id), oid)
     except Exception as e:
         logger.warning("push slip review failed: %s %s", e, _log_ctx(shop_id=shop_id, user_id=customer_user_id))
+
+# --- Customer notification after owner confirms/rejects payment intent ---
+def _push_payment_status_to_customer(access_token: Optional[str], customer_user_id: str, text: str) -> None:
+    """Push a short status message to the customer after owner confirms/rejects."""
+    if not access_token or not LineBotApi or not TextSendMessage or not customer_user_id:
+        return
+    try:
+        api = LineBotApi(access_token)
+        api.push_message(customer_user_id, TextSendMessage(text=text))
+    except Exception as e:
+        logger.warning("push payment status to customer failed: %s %s", e, _log_ctx(user_id=customer_user_id))
 
 # ---------- Helpers ----------
 
@@ -1563,6 +1589,18 @@ def line_webhook():
                     currency=(expected_cur or "THB"),
                 )
 
+                # Acknowledge to customer (avoid silent UX)
+                try:
+                    if TextSendMessage and api and replyToken:
+                        ack_txt = "รับสลิปเรียบร้อยแล้วครับ ✅\nทางร้านกำลังตรวจสอบ และจะยืนยันให้เร็วที่สุด"
+                        api.reply_message(replyToken, TextSendMessage(text=ack_txt))
+                    elif TextSendMessage and api:
+                        # Fallback to push if no replyToken
+                        ack_txt = "รับสลิปเรียบร้อยแล้วครับ ✅\nทางร้านกำลังตรวจสอบ และจะยืนยันให้เร็วที่สุด"
+                        api.push_message(user_id, TextSendMessage(text=ack_txt))
+                except Exception as _ack_err:
+                    logger.warning("slip ack failed: %s %s", _ack_err, _log_ctx(shop_id=shop_id, user_id=user_id))
+
                 logger.info("slip OCR intent created intent=%s match=%s %s", intent_id, match_status, _log_ctx(shop_id=shop_id, user_id=user_id))
         except Exception as _se:
             logger.warning("slip OCR flow failed: %s %s", _se, _log_ctx(shop_id=shop_id, user_id=user_id))
@@ -1578,6 +1616,61 @@ def line_webhook():
                     logger.info("pending quote set by owner amount=%.2f %s", float(exp_amt), _log_ctx(shop_id=shop_id, user_id=user_id))
         except Exception as _qe:
             logger.warning("set expected quote failed: %s %s", _qe, _log_ctx(shop_id=shop_id, user_id=user_id))
+
+        # --- Owner confirms or rejects payment intent (codes 1010/0011) ---
+        # Find the section where owner confirmation codes are handled
+        # We want to notify the customer after owner confirms/rejects with 1010/0011
+        # This block must be within the owner text handler
+        try:
+            if (oa_ctx == "consumer") and owner and (mtype == "text") and text:
+                # Confirm intent: 1010
+                if low_txt == "1010":
+                    intent_before = None
+                    try:
+                        intent_before = find_latest_pending_intent(shop_id)
+                    except Exception:
+                        intent_before = None
+                    payment = None
+                    try:
+                        payment = confirm_latest_pending_intent_to_payment(shop_id, user_id)
+                    except Exception as e:
+                        logger.warning("confirm_latest_pending_intent_to_payment failed: %s %s", e, _log_ctx(shop_id=shop_id, user_id=user_id))
+                        payment = None
+                    try:
+                        cid = (intent_before or {}).get("customer_user_id") if isinstance(intent_before, dict) else None
+                        if cid:
+                            _push_payment_status_to_customer(
+                                access_token,
+                                cid,
+                                "✅ ร้านยืนยันการชำระเงินเรียบร้อยแล้ว ขอบคุณครับ"
+                            )
+                    except Exception:
+                        pass
+                # Reject intent: 0011
+                elif low_txt == "0011":
+                    intent_before = None
+                    try:
+                        intent_before = find_latest_pending_intent(shop_id)
+                    except Exception:
+                        intent_before = None
+                    result = None
+                    try:
+                        result = reject_latest_pending_intent(shop_id, user_id)
+                    except Exception as e:
+                        logger.warning("reject_latest_pending_intent failed: %s %s", e, _log_ctx(shop_id=shop_id, user_id=user_id))
+                        result = None
+                    try:
+                        cid = (intent_before or {}).get("customer_user_id") if isinstance(intent_before, dict) else None
+                        if cid:
+                            _push_payment_status_to_customer(
+                                access_token,
+                                cid,
+                                "⚠️ ร้านยังไม่สามารถยืนยันยอดโอนได้ในตอนนี้ หากโอนแล้วกรุณาตรวจสอบอีกครั้ง หรือส่งสลิปใหม่ครับ"
+                            )
+                    except Exception:
+                        pass
+        except Exception as _owner_confirm_err:
+            logger.warning("owner confirm/reject handler failed: %s %s", _owner_confirm_err, _log_ctx(shop_id=shop_id, user_id=user_id))
         sess: Dict[str, Any] = {}
         step = 0
         if not owner:
