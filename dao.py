@@ -23,6 +23,14 @@ def _ensure_aware_utc(dt: datetime) -> datetime:
     return dt
 
 
+def _coerce_minutes(value: Any, default: int) -> int:
+    """Best-effort coerce to non-negative integer minutes."""
+    try:
+        return max(0, int(float(value)))
+    except Exception:
+        return default
+
+
 # ---------- shops / settings ----------
 
 # Canonical: settings/default under each shop
@@ -900,13 +908,22 @@ def set_intent_confirm_code(shop_id: str, intent_id: str, code: str) -> None:
 def find_pending_intent_by_code(shop_id: str, code: str) -> Optional[str]:
     db = get_db()
     col = db.collection("shops").document(shop_id).collection("payment_intents")
-    q = (
-        col.where("status", "==", "awaiting_owner")
-           .where("confirm_code", "==", code)
-           .limit(1)
-    )
-    docs = list(q.stream())
-    return docs[0].id if docs else None
+    try:
+        docs = list(
+            col.where("confirm_code", "==", code)
+               .order_by("created_at", direction=firestore.Query.DESCENDING)
+               .limit(20)
+               .stream()
+        )
+    except Exception:
+        docs = list(col.where("confirm_code", "==", code).limit(20).stream())
+    allowed_status = {"awaiting_owner_confirm", "awaiting_owner", "awaiting_owner_amount"}
+    for d in docs:
+        data = d.to_dict() or {}
+        if data.get("status") not in allowed_status:
+            continue
+        return d.id
+    return None
 
 
 def confirm_intent_to_payment(shop_id: str, code: str) -> Optional[str]:
@@ -920,11 +937,16 @@ def confirm_intent_to_payment(shop_id: str, code: str) -> Optional[str]:
     if not isnap.exists:
         return None
     i = isnap.to_dict() or {}
+    amt_raw = i.get("amount")
+    try:
+        amount = float(amt_raw)
+    except Exception:
+        return None
     # 1) create payment
     pid = record_manual_payment(
         shop_id=shop_id,
         customer_user_id=i.get("customer_user_id"),
-        amount=float(i.get("amount")),
+        amount=amount,
         currency=i.get("currency", "THB"),
         slip_gcs_uri=i.get("slip_gcs_uri"),
         message_id=i.get("message_id"),
@@ -949,29 +971,39 @@ def reject_intent_by_code(shop_id: str, code: str) -> Optional[str]:
 
 # ---------- helpers for latest intent ops & slip attachment ----------
 
-def find_latest_pending_intent(shop_id: str, within_minutes: int = 120) -> Optional[str]:
-    """Return the most recent awaiting_owner intent id within a time window, without requiring composite indexes."""
+def find_latest_intent_by_status(shop_id: str, statuses: Any, within_minutes: int = 120) -> Optional[str]:
+    """Return the most recent intent matching given statuses within a time window (client-side filtered)."""
     db = get_db()
     col = db.collection("shops").document(shop_id).collection("payment_intents")
     from datetime import datetime as _dt, timezone as _tz, timedelta as _td
-    try:
-        window_minutes = int(float(within_minutes))
-    except Exception:
-        window_minutes = 120
-    window_minutes = max(0, window_minutes)
+
+    status_list = []
+    if isinstance(statuses, (list, tuple, set)):
+        status_list = [str(s) for s in statuses if s]
+    elif isinstance(statuses, str):
+        status_list = [statuses]
+    if not status_list:
+        status_list = ["awaiting_owner_confirm", "awaiting_owner_amount", "awaiting_owner"]
+    status_priority = {s: idx for idx, s in enumerate(status_list)}
+    status_allowed = set(status_list)
+
+    window_minutes = _coerce_minutes(within_minutes, 120)
     since = _dt.now(_tz.utc) - _td(minutes=window_minutes)
-    # Avoid composite index by not combining where(status) + order_by(created_at)
-    # Read recent docs by created_at and filter in memory.
+
     try:
         docs = list(col.order_by("created_at", direction=firestore.Query.DESCENDING).limit(50).stream())
     except Exception:
         # Fallback: no order, just limit
         docs = list(col.limit(50).stream())
+
     latest_id = None
     latest_ts = None
+    latest_pri = None
+
     for d in docs:
         data = d.to_dict() or {}
-        if data.get("status") != "awaiting_owner":
+        status = data.get("status")
+        if status not in status_allowed:
             continue
         cat = data.get("created_at")
         try:
@@ -984,20 +1016,34 @@ def find_latest_pending_intent(shop_id: str, within_minutes: int = 120) -> Optio
                 cat_dt = None
         except Exception:
             cat_dt = None
-        if cat_dt is None:
+        if cat_dt is None or cat_dt < since:
             continue
-        if cat_dt < since:
-            continue
-        if latest_ts is None or cat_dt > latest_ts:
+        pri = status_priority.get(status, len(status_priority))
+        if (latest_ts is None) or (cat_dt > latest_ts) or ((cat_dt == latest_ts) and (latest_pri is not None and pri < latest_pri)):
             latest_ts = cat_dt
             latest_id = d.id
+            latest_pri = pri
+
     return latest_id
 
 
+def find_latest_pending_intent(shop_id: str, within_minutes: int = 120) -> Optional[str]:
+    """Backward-compatible helper for awaiting_owner* statuses."""
+    return find_latest_intent_by_status(
+        shop_id,
+        statuses=["awaiting_owner_confirm", "awaiting_owner_amount", "awaiting_owner"],
+        within_minutes=within_minutes,
+    )
+
+
 def confirm_latest_pending_intent_to_payment(shop_id: str, within_minutes: int = 120) -> Optional[str]:
-    """Convert the most recent awaiting_owner intent to a confirmed payment and return payment_id."""
+    """Convert the most recent awaiting_owner* intent to a confirmed payment and return payment_id."""
     db = get_db()
-    iid = find_latest_pending_intent(shop_id, within_minutes=within_minutes)
+    iid = find_latest_intent_by_status(
+        shop_id,
+        statuses=["awaiting_owner_confirm", "awaiting_owner"],
+        within_minutes=within_minutes,
+    )
     if not iid:
         return None
     iref = db.collection("shops").document(shop_id).collection("payment_intents").document(iid)
@@ -1005,10 +1051,15 @@ def confirm_latest_pending_intent_to_payment(shop_id: str, within_minutes: int =
     if not isnap.exists:
         return None
     i = isnap.to_dict() or {}
+    amt_raw = i.get("amount")
+    try:
+        amount = float(amt_raw)
+    except Exception:
+        return None
     pid = record_manual_payment(
         shop_id=shop_id,
         customer_user_id=i.get("customer_user_id"),
-        amount=float(i.get("amount")),
+        amount=amount,
         currency=i.get("currency", "THB"),
         slip_gcs_uri=i.get("slip_gcs_uri"),
         message_id=i.get("message_id"),
@@ -1020,7 +1071,11 @@ def confirm_latest_pending_intent_to_payment(shop_id: str, within_minutes: int =
 
 def reject_latest_pending_intent(shop_id: str, within_minutes: int = 120) -> Optional[str]:
     db = get_db()
-    iid = find_latest_pending_intent(shop_id, within_minutes=within_minutes)
+    iid = find_latest_intent_by_status(
+        shop_id,
+        statuses=["awaiting_owner_confirm", "awaiting_owner_amount", "awaiting_owner"],
+        within_minutes=within_minutes,
+    )
     if not iid:
         return None
     iref = db.collection("shops").document(shop_id).collection("payment_intents").document(iid)
@@ -1035,7 +1090,7 @@ def attach_recent_intent_by_user(
     message_id: Optional[str],
     within_minutes: int = 30,
 ) -> Optional[str]:
-    """Attach slip to the latest awaiting_owner intent by this user within a window. Returns intent_id if updated.
+    """Attach slip to the latest awaiting_owner* intent by this user within a window. Returns intent_id if updated.
     Avoid composite indexes by fetching recent docs and filtering in memory.
     Additionally, if the intent is already converted to a payment (has payment_id),
     backfill the slip to that payment document too.
@@ -1044,11 +1099,7 @@ def attach_recent_intent_by_user(
         return None
     db = get_db()
     from datetime import datetime as _dt, timezone as _tz, timedelta as _td
-    try:
-        window_minutes = int(float(within_minutes))
-    except Exception:
-        window_minutes = 30
-    window_minutes = max(0, window_minutes)
+    window_minutes = _coerce_minutes(within_minutes, 30)
     since = _dt.now(_tz.utc) - _td(minutes=window_minutes)
     col = db.collection("shops").document(shop_id).collection("payment_intents")
 
@@ -1068,6 +1119,7 @@ def attach_recent_intent_by_user(
     target_ts = None
     target_was_confirmed = False
     target_payment_id = None
+    preferred_statuses = ("awaiting_owner_amount", "awaiting_owner_confirm", "awaiting_owner")
 
     for doc in docs:
         d = doc.to_dict() or {}
@@ -1089,8 +1141,10 @@ def attach_recent_intent_by_user(
         if d.get("slip_gcs_uri") or d.get("message_id"):
             continue
 
-        # Pick first candidate: awaiting_owner gets priority
-        if d.get("status") == "awaiting_owner":
+        status = d.get("status")
+
+        # Pick first candidate: awaiting_owner* gets priority
+        if status in preferred_statuses:
             target_id = doc.id
             target_ts = cat_dt
             target_was_confirmed = False

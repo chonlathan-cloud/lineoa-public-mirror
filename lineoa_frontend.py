@@ -83,7 +83,7 @@ from dao import (
     confirm_payment_by_code, reject_payment_by_code,
     create_payment_intent, set_intent_confirm_code, 
     find_pending_intent_by_code, confirm_intent_to_payment, reject_intent_by_code,
-    find_latest_pending_intent, confirm_latest_pending_intent_to_payment, reject_latest_pending_intent, attach_recent_intent_by_user,
+    find_latest_intent_by_status, find_latest_pending_intent, confirm_latest_pending_intent_to_payment, reject_latest_pending_intent, attach_recent_intent_by_user,
     find_recent_pending_magic_link, bind_owner, mark_magic_link_used,
 )
 try:
@@ -353,24 +353,25 @@ def _push_slip_review_to_owners(shop_id: str, access_token: Optional[str], custo
         if not owners:
             return
 
-        if show_amount and isinstance(amount, (int, float)):
+        amount_known = show_amount and isinstance(amount, (int, float))
+        if amount_known:
             amt_txt = f"{float(amount):.2f} {currency}"
             header = f"มีการแจ้งโอนจากลูกค้า\nยอด: {amt_txt}"
         else:
-            header = "มีการแจ้งโอนจากลูกค้า\nกรุณาตรวจสอบยอดจากแอปธนาคารของคุณ"
+            header = "มีการแจ้งโอนจากลูกค้า\nกรุณาตรวจสอบสลิป แล้วพิมพ์ \"ยอด 100\" หรือ \"ยอด=100\""
 
         # Prefer a public HTTPS URL for better UX (owners can tap-open)
-        slip_url = slip_gcs_uri
+        slip_url = None
         try:
-            if slip_url and isinstance(slip_url, str):
-                s = slip_url.strip()
-                # If we got a gs:// URI, convert to public URL when possible
+            if slip_gcs_uri and isinstance(slip_gcs_uri, str):
+                s = slip_gcs_uri.strip()
                 if s.startswith("gs://") and MEDIA_PUBLIC_BASE and MEDIA_BUCKET:
                     prefix = f"gs://{MEDIA_BUCKET}/"
                     if s.startswith(prefix):
                         path = s[len(prefix):]
                         slip_url = f"{MEDIA_PUBLIC_BASE}/{path}"
-                # If we got an http(s) URL already, keep it
+                if not slip_url:
+                    slip_url = s
         except Exception:
             slip_url = slip_gcs_uri
 
@@ -1529,30 +1530,34 @@ def line_webhook():
                     expected_amt = float(pending.get("expected_amount"))
                     expected_cur = pending.get("currency") or "THB"
 
-                # Gate OCR: run only when we have expected amount (reduce cost / false positives)
+                # Always attempt OCR when we have image bytes
                 ocr = {"amount": None, "confidence": None, "status": "skipped", "text_sample": ""}
-                if expected_amt is not None and content:
+                if content:
                     ocr = _ocr_slip_amount(content)
 
-                ocr_amt = ocr.get("amount") if isinstance(ocr, dict) else None
-                try:
-                    ocr_amt = float(ocr_amt) if ocr_amt is not None else None
-                except Exception:
-                    ocr_amt = None
+                ocr_amt = None
+                if isinstance(ocr, dict):
+                    try:
+                        raw_amt = ocr.get("amount")
+                        ocr_amt = float(raw_amt) if raw_amt is not None else None
+                    except Exception:
+                        ocr_amt = None
 
                 match_status = "unknown"
                 delta = None
-                show_amount = False
                 threshold = float(os.environ.get("PAYMENT_OCR_MATCH_THRESHOLD", "1.0") or "1.0")
 
                 if expected_amt is not None and ocr_amt is not None:
                     delta = abs(ocr_amt - expected_amt)
                     if delta <= threshold:
                         match_status = "match"
-                        show_amount = True
                     else:
                         match_status = "mismatch"
-                        show_amount = False
+
+                stored_amount = ocr_amt if (ocr_amt is not None) else expected_amt
+                intent_status = "awaiting_owner_confirm" if stored_amount is not None else "awaiting_owner_amount"
+                show_amount = isinstance(stored_amount, (int, float))
+                amount_source = "ocr" if ocr_amt is not None else "unknown"
 
                 # Create payment_intent directly (so existing 1010/0011 flow works)
                 db = get_db()
@@ -1560,14 +1565,14 @@ def line_webhook():
                 intent_ref = db.collection("shops").document(shop_id).collection("payment_intents").document()
                 intent_id = intent_ref.id
 
-                stored_amount = ocr_amt if (ocr_amt is not None) else expected_amt
-                intent_ref.set({
-                    "status": "awaiting_owner",
+                intent_doc = {
+                    "status": intent_status,
                     "created_at": now_utc,
                     "updated_at": now_utc,
                     "customer_user_id": user_id,
                     "currency": expected_cur or "THB",
-                    "amount": stored_amount,
+                    "amount": float(stored_amount) if stored_amount is not None else None,
+                    "amount_source": amount_source,
                     "source": "slip_ocr",
                     "slip_gcs_uri": slip_gcs_uri,
                     "expected_amount": expected_amt,
@@ -1576,7 +1581,8 @@ def line_webhook():
                     "ocr_status": ocr.get("status") if isinstance(ocr, dict) else None,
                     "match_status": match_status,
                     "match_delta": delta,
-                }, merge=True)
+                }
+                intent_ref.set(intent_doc, merge=True)
 
                 # Notify owners with UX rules:
                 _push_slip_review_to_owners(
@@ -1585,7 +1591,7 @@ def line_webhook():
                     customer_user_id=user_id,
                     slip_gcs_uri=slip_gcs_uri,
                     show_amount=show_amount,
-                    amount=(expected_amt if show_amount else None),
+                    amount=(stored_amount if show_amount else None),
                     currency=(expected_cur or "THB"),
                 )
 
@@ -1601,7 +1607,19 @@ def line_webhook():
                 except Exception as _ack_err:
                     logger.warning("slip ack failed: %s %s", _ack_err, _log_ctx(shop_id=shop_id, user_id=user_id))
 
-                logger.info("slip OCR intent created intent=%s match=%s %s", intent_id, match_status, _log_ctx(shop_id=shop_id, user_id=user_id))
+                ocr_status = ocr.get("status") if isinstance(ocr, dict) else None
+                text_sample = (ocr.get("text_sample") or "") if isinstance(ocr, dict) else ""
+                ocr_conf = ocr.get("confidence") if isinstance(ocr, dict) else None
+                logger.info(
+                    "slip intent created intent=%s status=%s ocr_status=%s ocr_amount=%s conf=%s text_len=%s %s",
+                    intent_id,
+                    intent_status,
+                    ocr_status,
+                    ocr_amt,
+                    ocr_conf,
+                    len(text_sample),
+                    _log_ctx(shop_id=shop_id, user_id=user_id),
+                )
         except Exception as _se:
             logger.warning("slip OCR flow failed: %s %s", _se, _log_ctx(shop_id=shop_id, user_id=user_id))
 
@@ -1617,96 +1635,6 @@ def line_webhook():
         except Exception as _qe:
             logger.warning("set expected quote failed: %s %s", _qe, _log_ctx(shop_id=shop_id, user_id=user_id))
 
-        # --- Owner confirms or rejects payment intent (codes 1010/0011) ---
-        # Find the section where owner confirmation codes are handled
-        # We want to notify the customer after owner confirms/rejects with 1010/0011
-        # This block must be within the owner text handler
-        try:
-            if (oa_ctx == "consumer") and owner and (mtype == "text") and text:
-                # Confirm intent: 1010
-                if low_txt == "1010":
-                    intent_id_before = None
-                    cid = None
-                    try:
-                        intent_id_before = find_latest_pending_intent(shop_id)
-                        if intent_id_before:
-                            db0 = get_db()
-                            snap0 = (
-                                db0.collection("shops").document(shop_id)
-                                   .collection("payment_intents").document(intent_id_before)
-                                   .get()
-                            )
-                            if snap0.exists:
-                                d0 = snap0.to_dict() or {}
-                                cid = d0.get("customer_user_id")
-                    except Exception:
-                        intent_id_before = None
-                        cid = None
-                    payment = None
-                    try:
-                        payment = confirm_latest_pending_intent_to_payment(shop_id)
-                    except Exception as e:
-                        logger.warning("confirm_latest_pending_intent_to_payment failed: %s %s", e, _log_ctx(shop_id=shop_id, user_id=user_id))
-                        payment = None
-                    # Notify customer only when confirm succeeds
-                    if payment and cid:
-                        try:
-                            _push_payment_status_to_customer(
-                                access_token,
-                                cid,
-                                "✅ ร้านยืนยันการชำระเงินเรียบร้อยแล้ว ขอบคุณครับ"
-                            )
-                        except Exception:
-                            pass
-
-                    # Reply owner for clarity
-                    if payment:
-                        _reply_text_simple("✅ ยืนยันเรียบร้อยแล้วครับ")
-                    else:
-                        _reply_text_simple("❌ ยืนยันไม่สำเร็จ (ไม่พบรายการรอยืนยัน หรือหมดอายุแล้ว)\nลองส่งสลิปใหม่ หรือพิมพ์ 1010 อีกครั้งครับ")
-                # Reject intent: 0011
-                elif low_txt == "0011":
-                    intent_id_before = None
-                    cid = None
-                    try:
-                        intent_id_before = find_latest_pending_intent(shop_id)
-                        if intent_id_before:
-                            db0 = get_db()
-                            snap0 = (
-                                db0.collection("shops").document(shop_id)
-                                   .collection("payment_intents").document(intent_id_before)
-                                   .get()
-                            )
-                            if snap0.exists:
-                                d0 = snap0.to_dict() or {}
-                                cid = d0.get("customer_user_id")
-                    except Exception:
-                        intent_id_before = None
-                        cid = None
-                    result = None
-                    try:
-                        result = reject_latest_pending_intent(shop_id)
-                    except Exception as e:
-                        logger.warning("reject_latest_pending_intent failed: %s %s", e, _log_ctx(shop_id=shop_id, user_id=user_id))
-                        result = None
-                    # Notify customer only when reject succeeds
-                    if result and cid:
-                        try:
-                            _push_payment_status_to_customer(
-                                access_token,
-                                cid,
-                                "⚠️ ร้านยังไม่สามารถยืนยันยอดโอนได้ในตอนนี้ หากโอนแล้วกรุณาตรวจสอบอีกครั้ง หรือส่งสลิปใหม่ครับ"
-                            )
-                        except Exception:
-                            pass
-
-                    # Reply owner for clarity
-                    if result:
-                        _reply_text_simple("✅ รับทราบครับ (ปัดตกเรียบร้อย)")
-                    else:
-                        _reply_text_simple("❌ ปัดตกไม่สำเร็จ (ไม่พบรายการรอยืนยัน หรือหมดอายุแล้ว)\nลองส่ง 0011 ใหม่อีกครั้งครับ")
-        except Exception as _owner_confirm_err:
-            logger.warning("owner confirm/reject handler failed: %s %s", _owner_confirm_err, _log_ctx(shop_id=shop_id, user_id=user_id))
         sess: Dict[str, Any] = {}
         step = 0
         if not owner:
@@ -2115,63 +2043,160 @@ def line_webhook():
                                 upsert_owner_profile(shop_id, full_name=text)
                                 logger.info("owner full_name(saved by heuristic) %s name=%s", _log_ctx(shop_id, user_id, event_id, message_id), text)
                                 saved_owner_any = True
-                        if not saved_owner_any and text.startswith("ร้าน"):
-                            bn = text
-                            upsert_owner_profile(shop_id, business_name=bn)
-                            logger.info("owner business_name(saved by heuristic) %s name=%s", _log_ctx(shop_id, user_id, event_id, message_id), bn)
-                            saved_owner_any = True
+                    if not saved_owner_any and text.startswith("ร้าน"):
+                        bn = text
+                        upsert_owner_profile(shop_id, business_name=bn)
+                        logger.info("owner business_name(saved by heuristic) %s name=%s", _log_ctx(shop_id, user_id, event_id, message_id), bn)
+                        saved_owner_any = True
                     _ensure_shop_display_name(shop_id, access_token)
                     # Owner review commands with fixed codes: Confirm=1010, Reject=0011
                     try:
                         # Normalize spaces
                         low_compact = re.sub(r"\s+", " ", low).strip()
+                        try:
+                            owner_window_min = int(float(os.environ.get("PAYMENT_INTENT_OWNER_WINDOW_MINUTES", "120") or "120"))
+                        except Exception:
+                            owner_window_min = 120
+                        owner_window_min = max(0, owner_window_min)
+
+                        # --- Owner manual amount command (strict patterns) ---
+                        manual_amt = None
+                        if oa_ctx == "consumer":
+                            m_manual = re.match(r"^ยอด\s*(?:=|\s)\s*([0-9][0-9,]*(?:\.\d{1,2})?)\s*(?:บาท)?$", low_compact)
+                            if m_manual:
+                                try:
+                                    manual_amt = float(m_manual.group(1).replace(",", ""))
+                                except Exception:
+                                    manual_amt = None
+                        if oa_ctx == "consumer" and manual_amt is not None and manual_amt > 0:
+                            iid_manual = None
+                            try:
+                                iid_manual = find_latest_intent_by_status(
+                                    shop_id,
+                                    statuses=["awaiting_owner_amount", "awaiting_owner"],
+                                    within_minutes=owner_window_min,
+                                )
+                            except Exception as _me:
+                                logger.warning("find latest awaiting_owner_amount failed: %s %s", _me, _log_ctx(shop_id, user_id, event_id, message_id))
+                                iid_manual = None
+                            if not iid_manual:
+                                _reply_text_simple(f"⚠️ ไม่พบสลิปที่รอระบุยอดในช่วง {owner_window_min} นาทีที่ผ่านมา\nกรุณาส่งสลิปใหม่ครับ")
+                                continue
+                            try:
+                                db = get_db()
+                                snap_manual = db.collection("shops").document(shop_id).collection("payment_intents").document(iid_manual).get()
+                                existing = snap_manual.to_dict() if snap_manual.exists else {}
+                                if isinstance(existing.get("amount"), (int, float)):
+                                    _reply_text_simple("⚠️ รายการล่าสุดมีจำนวนเงินแล้ว พิมพ์ 1010 เพื่อยืนยัน หรือ 0011 เพื่อปัดตก")
+                                    continue
+                                db.collection("shops").document(shop_id).collection("payment_intents").document(iid_manual).set({
+                                    "amount": float(manual_amt),
+                                    "amount_source": "owner_manual",
+                                    "status": "awaiting_owner_confirm",
+                                    "updated_at": datetime.now(timezone.utc),
+                                }, merge=True)
+                                ack_msg = f"✅ Received amount: {float(manual_amt):.2f} THB. Now reply 1010 to confirm or 0011 to reject."
+                                if TextSendMessage and QuickReply and QuickReplyButton and MessageAction:
+                                    qr_ack = QuickReply(items=[
+                                        QuickReplyButton(action=MessageAction(label="ยืนยัน 1010", text="1010")),
+                                        QuickReplyButton(action=MessageAction(label="ปัดตก 0011", text="0011")),
+                                    ])
+                                    _reply_line(TextSendMessage(text=ack_msg, quick_reply=qr_ack))
+                                else:
+                                    _reply_text_simple(ack_msg)
+                                logger.info("owner set manual amount iid=%s amount=%.2f %s", iid_manual, float(manual_amt), _log_ctx(shop_id, user_id, event_id, message_id))
+                            except Exception as _me:
+                                logger.warning("set manual amount failed: %s %s", _me, _log_ctx(shop_id, user_id, event_id, message_id))
+                            continue
 
                         # --- Reject first ---
-                        if low_compact in ("0011", "reject 0011", "ปัดตก 0011", "ไม่ใช่ 0011", "ยกเลิก 0011") or re.match(r"^(ปัดตก|reject|ไม่ใช่|ยกเลิก)\s+0011$", low_compact):
-                            iid = reject_latest_pending_intent(shop_id, within_minutes=120)
-                            if iid and access_token and LineBotApi and TextSendMessage:
-                                api = LineBotApi(access_token)
-                                # Ack to owner
+                        if oa_ctx == "consumer" and (low_compact in ("0011", "reject 0011", "ปัดตก 0011", "ไม่ใช่ 0011", "ยกเลิก 0011") or re.match(r"^(ปัดตก|reject|ไม่ใช่|ยกเลิก)\s+0011$", low_compact)):
+                            iid = find_latest_intent_by_status(
+                                shop_id,
+                                statuses=["awaiting_owner_confirm", "awaiting_owner_amount", "awaiting_owner"],
+                                within_minutes=owner_window_min,
+                            )
+                            cus = None
+                            if iid:
                                 try:
-                                    api.push_message(user_id, TextSendMessage(text="ปัดตกแล้ว (0011)"))
+                                    snap = get_db().collection("shops").document(shop_id).collection("payment_intents").document(iid).get()
+                                    data = snap.to_dict() or {}
+                                    cus = data.get("customer_user_id")
                                 except Exception:
-                                    logger.warning("push reject ack to owner failed %s", _log_ctx(shop_id, user_id, event_id, message_id))
-                                # Notify customer (C) for the rejected intent
-                                try:
-                                    db = get_db()
-                                    isnap = db.collection("shops").document(shop_id).collection("payment_intents").document(iid).get()
-                                    idata = isnap.to_dict() or {}
-                                    cus = idata.get("customer_user_id")
-                                    if cus:
-                                        api.push_message(cus, TextSendMessage(text="กรุณาส่งใหม่ เพื่อยืนยันการชำระเงินอีกครั้งครับ"))
-                                except Exception as _pe:
-                                    logger.warning("push reject-to-customer failed: %s %s", _pe, _log_ctx(shop_id, user_id, event_id, message_id))
+                                    cus = None
+                            result = None
+                            try:
+                                result = reject_latest_pending_intent(shop_id, within_minutes=owner_window_min)
+                            except Exception as e:
+                                logger.warning("reject_latest_pending_intent failed: %s %s", e, _log_ctx(shop_id=shop_id, user_id=user_id))
+                                result = None
+                            if result:
+                                _reply_text_simple("✅ ปัดตกแล้ว (0011)")
+                                if access_token and LineBotApi and TextSendMessage and cus:
+                                    try:
+                                        api_push = LineBotApi(access_token)
+                                        api_push.push_message(cus, TextSendMessage(text="⚠️ ร้านยังไม่สามารถยืนยันยอดโอนได้ในตอนนี้ หากโอนแล้วกรุณาตรวจสอบอีกครั้ง หรือส่งสลิปใหม่ครับ"))
+                                    except Exception as _pe:
+                                        logger.warning("push reject-to-customer failed: %s %s", _pe, _log_ctx(shop_id, user_id, event_id, message_id))
+                            else:
+                                _reply_text_simple("❌ ปัดตกไม่สำเร็จ (ไม่พบรายการรอยืนยัน)")
                             logger.info("owner rejected latest intent iid=%s %s", iid, _log_ctx(shop_id, user_id, event_id, message_id))
                             continue
 
                         # --- Explicit confirm (fixed code 1010) ---
-                        if low_compact in ("1010", "ยืนยัน 1010", "confirm 1010", "ok 1010", "ตกลง 1010", "approve 1010") or re.match(r"^(ยืนยัน|confirm|ok|ตกลง|approve)\s+1010$", low_compact):
-                            pid = confirm_latest_pending_intent_to_payment(shop_id, within_minutes=120)
-                            if pid and access_token and LineBotApi and TextSendMessage:
-                                api = LineBotApi(access_token)
-                                # Ack to owner
+                        if oa_ctx == "consumer" and (low_compact in ("1010", "ยืนยัน 1010", "confirm 1010", "ok 1010", "ตกลง 1010", "approve 1010") or re.match(r"^(ยืนยัน|confirm|ok|ตกลง|approve)\s+1010$", low_compact)):
+                            iid = find_latest_intent_by_status(
+                                shop_id,
+                                statuses=["awaiting_owner_confirm", "awaiting_owner_amount", "awaiting_owner"],
+                                within_minutes=owner_window_min,
+                            )
+                            if not iid:
+                                _reply_text_simple("⚠️ ไม่มีรายการรอยืนยันครับ")
+                                continue
+                            cus = None
+                            intent_amount = None
+                            try:
+                                snap = get_db().collection("shops").document(shop_id).collection("payment_intents").document(iid).get()
+                                data = snap.to_dict() or {}
+                                cus = data.get("customer_user_id")
+                                if isinstance(data.get("amount"), (int, float)):
+                                    intent_amount = float(data.get("amount"))
+                            except Exception:
+                                intent_amount = None
+                            if intent_amount is None:
+                                _reply_text_simple("⚠️ No amount detected. Please type: ยอด 100")
+                                continue
+
+                            pid = confirm_latest_pending_intent_to_payment(shop_id, within_minutes=owner_window_min)
+                            api_push = None
+                            if access_token and LineBotApi and TextSendMessage:
                                 try:
-                                    api.push_message(user_id, TextSendMessage(text="ยืนยันสำเร็จ (1010)"))
+                                    api_push = LineBotApi(access_token)
                                 except Exception:
-                                    logger.warning("push confirm ack to owner failed %s", _log_ctx(shop_id, user_id, event_id, message_id))
-                                # Notify customer (C)
+                                    api_push = None
+
+                            if pid and api_push:
                                 try:
-                                    db = get_db()
-                                    pdoc = db.collection("shops").document(shop_id).collection("payments").document(pid).get()
+                                    pdoc = get_db().collection("shops").document(shop_id).collection("payments").document(pid).get()
                                     pdata = pdoc.to_dict() or {}
-                                    cus = pdata.get("customer_user_id")
+                                    cus_payment = pdata.get("customer_user_id") or cus
                                     amt = pdata.get("amount")
                                     cur = pdata.get("currency") or "THB"
-                                    if cus:
+                                    if cus_payment:
                                         txt = (f"ร้านยืนยันการชำระเงินเรียบร้อย จำนวน {float(amt):.2f} {cur} ขอบคุณครับ" if isinstance(amt, (int, float)) else "ร้านยืนยันการชำระเงินเรียบร้อย ขอบคุณครับ")
-                                        api.push_message(cus, TextSendMessage(text=txt))
+                                        api_push.push_message(cus_payment, TextSendMessage(text=txt))
                                 except Exception as _pe:
                                     logger.warning("push confirm-to-customer failed: %s %s", _pe, _log_ctx(shop_id, user_id, event_id, message_id))
+
+                            if pid:
+                                ack_sent = _reply_text_simple("✅ ยืนยันเรียบร้อยแล้วครับ")
+                                if (not ack_sent) and api_push:
+                                    try:
+                                        api_push.push_message(user_id, TextSendMessage(text="ยืนยันสำเร็จ (1010)"))
+                                    except Exception:
+                                        logger.warning("push confirm ack to owner failed %s", _log_ctx(shop_id, user_id, event_id, message_id))
+                            else:
+                                _reply_text_simple("❌ ยืนยันไม่สำเร็จ (ลองพิมพ์ 1010 หรือระบุยอดด้วย \"ยอด 100\")")
                             logger.info("owner confirmed latest intent -> payment %s %s", pid, _log_ctx(shop_id, user_id, event_id, message_id))
                             continue
                     except Exception as _oe:
@@ -2290,7 +2315,7 @@ def line_webhook():
                 dl = _download_line_content(access_token, message_id)
                 content, content_type = (dl if isinstance(dl, tuple) else (dl, None))
                 media_info = _store_media(shop_id, mtype, message_id, content, content_type)
-                # --- Auto-attach slip to latest awaiting_owner intent by this user (image only) ---
+                # --- Auto-attach slip to latest awaiting_owner* intent by this user (image only) ---
                 try:
                     if mtype == "image":
                         gcs_uri0 = (media_info or {}).get("gcs_uri")

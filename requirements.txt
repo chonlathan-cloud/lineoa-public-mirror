@@ -13,6 +13,7 @@ google-cloud-secret-manager>=2.20,<3
 google-cloud-storage>=3.3,<4
 google-cloud-pubsub>=2.20,<3
 google-cloud-vision>=3.5,<4
+google-cloud-aiplatform>=1.66.0
 
 # Utils
 python-dateutil>=2.9.0.post0,<3
