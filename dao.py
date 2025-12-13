@@ -31,6 +31,140 @@ def _coerce_minutes(value: Any, default: int) -> int:
         return default
 
 
+# ---------- slip signature gate (OCR text scoring) ----------
+
+import re
+
+# Regex patterns (kept simple for speed; used for gating only)
+_MONEY_RE = re.compile(r"\b\d{1,3}(?:,\d{3})*(?:\.\d{2})\b|\b\d+(?:\.\d{2})\b")
+_TIME_RE = re.compile(r"\b\d{1,2}:\d{2}\b")
+_DATE_RE = re.compile(r"\b\d{4}-\d{2}-\d{2}\b")
+
+# NOTE: Gate is designed to minimize false positives.
+# We require at least (strong OR bank). Numbers-only must hard-fail.
+
+_BANK_KW = (
+    "kbank", "kasikorn", "scb", "siam commercial", "ktb", "krungthai",
+    "bbl", "bangkok bank", "bay", "krungsri", "ttb", "tmb",
+    "gsb", "uob", "cimb", "tisco", "kk", "kiatnakin",
+    "lhbank", "baac",
+)
+
+_STRONG_KW_3 = (
+    "transfer successful", "transaction successful", "payment successful",
+    "โอนเงินสำเร็จ", "โอนสำเร็จ", "ชำระเงินสำเร็จ",
+)
+
+_STRONG_KW_2 = (
+    "reference", "ref no", "reference no", "หมายเลขอ้างอิง", "เลขอ้างอิง",
+    "promptpay", "พร้อมเพย์", "พร้อม เพย์",
+)
+
+_MID_KW_1 = (
+    "fee", "ค่าธรรมเนียม", "mobile banking", "internet banking",
+)
+
+_CURRENCY_KW = (
+    "thb", "฿", "บาท",
+)
+
+_ANTI_KW_2 = (
+    "menu", "ราคา", "โปรโมชั่น", "promotion", "catalog", "product",
+)
+
+
+def score_slip_signature(raw_text: str, *, threshold: int = 5) -> Dict[str, Any]:
+    """Score OCR-extracted text to decide whether an image is likely a transfer slip.
+
+    Returns:
+      {
+        'is_slip': bool,
+        'score': int,
+        'reasons': List[str],
+      }
+
+    Design goals:
+      - Keep it cheap/fast (used as a gate before Gemini).
+      - Minimize false positives (random images with numbers).
+      - Require at least (strong OR bank). Numbers-only hard-fail.
+    """
+    reasons: List[str] = []
+
+    if not raw_text or not str(raw_text).strip():
+        return {"is_slip": False, "score": 0, "reasons": ["empty"]}
+
+    t = str(raw_text).lower()
+    t = re.sub(r"\s+", " ", t).strip()
+
+    score = 0
+    strong_hit = False
+    bank_hit = False
+
+    # Anti-signatures (penalty)
+    if any(k in t for k in _ANTI_KW_2):
+        score -= 2
+        reasons.append("anti_menu_promo")
+
+    # Strong evidence +3
+    for k in _STRONG_KW_3:
+        if k in t:
+            score += 3
+            strong_hit = True
+            reasons.append(f"strong3:{k}")
+            break
+
+    # Strong evidence +2
+    for k in _STRONG_KW_2:
+        if k in t:
+            score += 2
+            strong_hit = True
+            reasons.append(f"strong2:{k}")
+            break
+
+    # Bank evidence +2
+    if any(b in t for b in _BANK_KW):
+        score += 2
+        bank_hit = True
+        reasons.append("bank")
+
+    # Mid evidence +1
+    for k in _MID_KW_1:
+        if k in t:
+            score += 1
+            reasons.append(f"mid:{k}")
+            break
+
+    # Currency +1
+    if any(k in t for k in _CURRENCY_KW):
+        score += 1
+        reasons.append("currency")
+
+    # Money pattern +1
+    if _MONEY_RE.search(t):
+        score += 1
+        reasons.append("money_pattern")
+
+    # Date/time +1
+    if _TIME_RE.search(t) or _DATE_RE.search(t):
+        score += 1
+        reasons.append("datetime")
+
+    # Hard fail rule: must have at least (strong OR bank)
+    if not strong_hit and not bank_hit:
+        return {"is_slip": False, "score": score, "reasons": reasons + ["hard_fail_no_strong_no_bank"]}
+
+    has_support = ("bank" in reasons) or ("currency" in reasons) or ("money_pattern" in reasons)
+
+    # PASS rules
+    if strong_hit and has_support:
+        return {"is_slip": True, "score": score, "reasons": reasons + ["pass:P1"]}
+
+    if score >= int(threshold):
+        return {"is_slip": True, "score": score, "reasons": reasons + ["pass:P2"]}
+
+    return {"is_slip": False, "score": score, "reasons": reasons + ["fail:below_threshold"]}
+
+
 # ---------- shops / settings ----------
 
 # Canonical: settings/default under each shop

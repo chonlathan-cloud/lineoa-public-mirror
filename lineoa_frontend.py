@@ -85,6 +85,7 @@ from dao import (
     find_pending_intent_by_code, confirm_intent_to_payment, reject_intent_by_code,
     find_latest_intent_by_status, find_latest_pending_intent, confirm_latest_pending_intent_to_payment, reject_latest_pending_intent, attach_recent_intent_by_user, update_latest_intent_amount,
     find_recent_pending_magic_link, bind_owner, mark_magic_link_used,
+    score_slip_signature,
 )
 try:
     from admin.onboarding import (
@@ -270,7 +271,19 @@ def _ocr_slip_amount(content_bytes: bytes) -> Dict[str, Any]:
             return {"amount": None, "confidence": conf, "status": "no_text", "text_sample": ""}
 
         low = (text_all or "").lower()
+        gate = score_slip_signature(text_all)
 
+        # Gate: if OCR text doesn't look like a slip, treat as normal image (no amount).
+        # The caller (image handler) should use `gate` to decide whether to create intent/push to owners.
+        if not gate.get("is_slip"):
+            return {
+                "amount": None,
+                "confidence": conf,
+                "status": "not_slip",
+                "text_sample": (text_all or "")[:500],
+                "gate": gate,
+            }
+    
         keyword_patterns = [
             r"(?:จำนวนเงิน|ยอดเงิน|ยอดโอน|ยอดชำระ|ยอดสุทธิ|ยอดรวม)\s*[:：]?\s*(\d+(?:\.\d{1,2})?)",
             r"(?:amount|transfer amount|total)\s*[:：]?\s*(\d+(?:\.\d{1,2})?)",
@@ -281,20 +294,19 @@ def _ocr_slip_amount(content_bytes: bytes) -> Dict[str, Any]:
                 if m:
                     v = float(m.group(1))
                     if 1 <= v <= 1000000:
-                        return {"amount": v, "confidence": conf, "status": "ok", "text_sample": (text_all or "")[:500]}
+                        return {"amount": v, "confidence": conf, "status": "ok", "text_sample": (text_all or "")[:500], "gate": gate}
             except Exception:
                 continue
 
         cands = _extract_amount_candidates(text_all)
         if not cands:
-            return {"amount": None, "confidence": conf, "status": "no_amount", "text_sample": (text_all or "")[:500]}
+            return {"amount": None, "confidence": conf, "status": "no_amount", "text_sample": (text_all or "")[:500], "gate": gate}
         v = max(cands)
-        return {"amount": v, "confidence": conf, "status": "ok_fallback", "text_sample": (text_all or "")[:500]}
+        return {"amount": v, "confidence": conf, "status": "ok_fallback", "text_sample": (text_all or "")[:500], "gate": gate}
     except Exception as e:
         logger.warning("ocr_slip_amount failed: %s", e)
         return {"amount": None, "confidence": None, "status": "error", "text_sample": ""}
-
-
+    
 def _gemini_extract_amount_from_slip(public_url: str) -> Dict[str, Any]:
     """Use Vertex AI Gemini multimodal to extract transfer amount from slip URL."""
     if not public_url:
@@ -453,17 +465,39 @@ def _push_slip_review_to_owners(
         if not owners:
             return
 
-        amount_known = (ai_amount is not None) and (ai_confidence is not None) and (ai_confidence >= 0.75)
-        high_conf = amount_known and ai_confidence is not None and ai_confidence >= 0.9
+        # Normalize confidence: some extractors may return amount but omit confidence.
+        eff_conf: Optional[float] = ai_confidence
+        try:
+            if eff_conf is not None:
+                eff_conf = float(eff_conf)
+                eff_conf = max(0.0, min(1.0, eff_conf))
+        except Exception:
+            eff_conf = None
+
+        # If we have an amount but no confidence, treat as "moderate" so we don't fall into the manual-only branch.
+        if (ai_amount is not None) and (eff_conf is None):
+            eff_conf = 0.85
+
+        amount_known = (ai_amount is not None) and (eff_conf is not None) and (eff_conf >= 0.75)
+        high_conf = bool(amount_known and eff_conf is not None and eff_conf >= 0.90)
 
         if amount_known:
             amt_txt = f"{float(ai_amount):.2f} {currency}"
             if high_conf:
                 header = f"AI อ่านได้: {amt_txt} (มั่นใจสูง)"
             else:
-                header = f"AI คาดว่า: {amt_txt} (มั่นใจปานกลาง) กรุณาเปิดสลิปตรวจสอบ"
+                # include confidence when available (or derived)
+                header = f"AI คาดว่า: {amt_txt} (conf {eff_conf:.2f}) กรุณาเปิดสลิปตรวจสอบ"
         else:
             header = "กรุณาตรวจสอบสลิป แล้วกด 2020 และพิมพ์ \"ยอด 500\""
+
+        # Optional reason line (helps debugging / UX)
+        reason_txt = ""
+        try:
+            if isinstance(ai_reason, str) and ai_reason.strip():
+                reason_txt = f"\nหมายเหตุ: {ai_reason.strip()}"
+        except Exception:
+            reason_txt = ""
 
         # Prefer a public HTTPS URL for better UX (owners can tap-open)
         slip_url = None
@@ -486,7 +520,7 @@ def _push_slip_review_to_owners(
         action_txt = "ยืนยัน: 1010\nปัดตก: 0011\nใส่มือ: 2020"
         if not amount_known:
             action_txt = "ใส่มือ: 2020\nปัดตก: 0011"
-        msg = f"{header}{slip_txt}\n{action_txt}"
+        msg = f"{header}{reason_txt}{slip_txt}\n{action_txt}"
 
         for oid in owners:
             try:
@@ -1659,6 +1693,36 @@ def line_webhook():
                 if pending and isinstance(pending.get("expected_amount"), (int, float)):
                     expected_amt = float(pending.get("expected_amount"))
                     expected_cur = pending.get("currency") or "THB"
+
+                # ---- Slip gate (cheap): Vision OCR signature scoring before Gemini ----
+                ocr_gate = None
+                try:
+                    ocr_res_gate = _ocr_slip_amount(content) if content else {"status": "no_bytes", "gate": {"is_slip": False}}
+                    ocr_gate = (ocr_res_gate or {}).get("gate") if isinstance(ocr_res_gate, dict) else None
+                except Exception as _ge:
+                    ocr_res_gate = {"status": "gate_error", "gate": {"is_slip": False}}
+                    ocr_gate = {"is_slip": False}
+
+                # If it doesn't look like a transfer slip, treat it as a normal image:
+                # keep media stored, but DO NOT create payment_intent and DO NOT push to owners.
+                try:
+                    if ocr_gate and isinstance(ocr_gate, dict) and (not bool(ocr_gate.get("is_slip"))):
+                        logger.info(
+                            "image gate: not slip status=%s score=%s reasons=%s %s",
+                            (ocr_res_gate or {}).get("status"),
+                            (ocr_gate or {}).get("score"),
+                            (ocr_gate or {}).get("reasons"),
+                            _log_ctx(shop_id=shop_id, user_id=user_id, event_id=event_id, message_id=message_id),
+                        )
+                        # Optional: acknowledge receipt to customer, but keep it quiet (no owner push)
+                        try:
+                            if TextSendMessage and api and replyToken:
+                                api.reply_message(replyToken, TextSendMessage(text="รับรูปแล้วครับ ✅"))
+                        except Exception:
+                            pass
+                        continue
+                except Exception:
+                    pass
 
                 # Run Gemini multimodal extraction (fallback-safe)
                 ai_res = _gemini_extract_amount_from_slip(slip_public_url) if slip_public_url else {"amount": None, "confidence": None, "reason": "no_url", "status": "error"}
